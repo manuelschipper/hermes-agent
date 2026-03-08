@@ -157,3 +157,57 @@ class TestTokenEstimation:
         # Should be well above the 100K default threshold
         assert tokens > 100_000
         assert len(history) > 200
+
+
+# ---------------------------------------------------------------------------
+# Message rendering tests (friendly vs verbose)
+# ---------------------------------------------------------------------------
+
+def _hygiene_pre_compress_msg(progress_mode, msg_count, approx_tokens):
+    """Reproduce the pre-compression message logic from gateway/run.py."""
+    if progress_mode == "verbose":
+        return (f"🗜️ Session is large ({msg_count} messages, "
+                f"~{approx_tokens:,} tokens). Auto-compressing...")
+    return "🗜️ Session too long. Compressing context\u2026"
+
+
+def _hygiene_post_compress_msg(progress_mode, msg_count, new_count,
+                               approx_tokens, new_tokens):
+    """Reproduce the post-compression message logic from gateway/run.py."""
+    if progress_mode == "verbose":
+        return (f"🗜️ Compressed: {msg_count} → "
+                f"{new_count} messages, "
+                f"~{approx_tokens:,} → "
+                f"~{new_tokens:,} tokens")
+    return "🗜️ Done. Older messages summarized."
+
+
+class TestSessionHygieneMessages:
+    """Test that hygiene messages respect progress_mode (verbose vs friendly)."""
+
+    def test_pre_compress_friendly(self):
+        """Non-verbose mode shows friendly pre-compression message."""
+        msg = _hygiene_pre_compress_msg("all", 208, 37_138)
+        assert msg == "🗜️ Session too long. Compressing context\u2026"
+        assert "208" not in msg
+        assert "37,138" not in msg
+
+    def test_pre_compress_verbose(self):
+        """Verbose mode shows raw stats in pre-compression message."""
+        msg = _hygiene_pre_compress_msg("verbose", 208, 37_138)
+        assert "208 messages" in msg
+        assert "37,138 tokens" in msg
+        assert "Auto-compressing" in msg
+
+    def test_post_compress_friendly(self):
+        """Non-verbose mode shows friendly post-compression message."""
+        msg = _hygiene_post_compress_msg("all", 208, 8, 37_138, 2_500)
+        assert msg == "🗜️ Done. Older messages summarized."
+        assert "208" not in msg
+
+    def test_post_compress_verbose(self):
+        """Verbose mode shows raw stats in post-compression message."""
+        msg = _hygiene_post_compress_msg("verbose", 208, 8, 37_138, 2_500)
+        assert "208 → 8 messages" in msg
+        assert "37,138" in msg
+        assert "2,500" in msg

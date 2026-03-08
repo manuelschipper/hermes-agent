@@ -850,6 +850,7 @@ class GatewayRunner:
 
             # Read thresholds from config.yaml → session_hygiene section
             _hygiene_cfg = {}
+            _hyg_progress_mode = os.getenv("HERMES_TOOL_PROGRESS_MODE") or "all"
             try:
                 _hyg_cfg_path = _hermes_home / "config.yaml"
                 if _hyg_cfg_path.exists():
@@ -859,6 +860,11 @@ class GatewayRunner:
                     _hygiene_cfg = _hyg_data.get("session_hygiene", {})
                     if not isinstance(_hygiene_cfg, dict):
                         _hygiene_cfg = {}
+                    _hyg_progress_mode = (
+                        _hyg_data.get("display", {}).get("tool_progress")
+                        or os.getenv("HERMES_TOOL_PROGRESS_MODE")
+                        or "all"
+                    )
             except Exception:
                 pass
 
@@ -891,11 +897,12 @@ class GatewayRunner:
                 _hyg_adapter = self.adapters.get(source.platform)
                 if _hyg_adapter:
                     try:
-                        await _hyg_adapter.send(
-                            source.chat_id,
-                            f"🗜️ Session is large ({_msg_count} messages, "
-                            f"~{_approx_tokens:,} tokens). Auto-compressing..."
-                        )
+                        if _hyg_progress_mode == "verbose":
+                            _hyg_msg = (f"🗜️ Session is large ({_msg_count} messages, "
+                                        f"~{_approx_tokens:,} tokens). Auto-compressing...")
+                        else:
+                            _hyg_msg = "🗜️ Session too long. Compressing context\u2026"
+                        await _hyg_adapter.send(source.chat_id, _hyg_msg)
                     except Exception:
                         pass
 
@@ -947,13 +954,14 @@ class GatewayRunner:
 
                             if _hyg_adapter:
                                 try:
-                                    await _hyg_adapter.send(
-                                        source.chat_id,
-                                        f"🗜️ Compressed: {_msg_count} → "
-                                        f"{_new_count} messages, "
-                                        f"~{_approx_tokens:,} → "
-                                        f"~{_new_tokens:,} tokens"
-                                    )
+                                    if _hyg_progress_mode == "verbose":
+                                        _hyg_done_msg = (f"🗜️ Compressed: {_msg_count} → "
+                                                         f"{_new_count} messages, "
+                                                         f"~{_approx_tokens:,} → "
+                                                         f"~{_new_tokens:,} tokens")
+                                    else:
+                                        _hyg_done_msg = "🗜️ Done. Older messages summarized."
+                                    await _hyg_adapter.send(source.chat_id, _hyg_done_msg)
                                 except Exception:
                                     pass
 
@@ -2248,8 +2256,8 @@ class GatewayRunner:
             if not progress_queue:
                 return
             
-            # "new" mode: only report when tool changes
-            if progress_mode == "new" and tool_name == last_tool[0]:
+            # Dedup: "new" mode skips same-tool repeats; pseudo-events always dedup
+            if tool_name == last_tool[0] and (progress_mode == "new" or tool_name.startswith("_")):
                 return
             last_tool[0] = tool_name
             
@@ -2293,6 +2301,7 @@ class GatewayRunner:
                 "delegate_task": "🔀",
                 "clarify": "❓",
                 "skill_manage": "📝",
+                "_compression": "🗜️",
             }
             emoji = tool_emojis.get(tool_name, "⚙️")
             
@@ -2310,7 +2319,17 @@ class GatewayRunner:
                 # Truncate preview to keep messages clean
                 if len(preview) > 80:
                     preview = preview[:77] + "..."
-                msg = f"{emoji} {tool_name}: \"{preview}\""
+                # Pseudo-events (_compression, _thinking) show emoji + preview only
+                if tool_name.startswith("_"):
+                    if progress_mode == "verbose":
+                        msg = f"{emoji} {preview}"
+                    else:
+                        _friendly = {
+                            "_compression": "Session too long. Compressing context\u2026",
+                        }
+                        msg = f"{emoji} {_friendly.get(tool_name, preview)}"
+                else:
+                    msg = f"{emoji} {tool_name}: \"{preview}\""
             else:
                 msg = f"{emoji} {tool_name}..."
             

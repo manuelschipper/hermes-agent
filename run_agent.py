@@ -2472,7 +2472,18 @@ class AIAgent:
         # Pre-compression memory flush: let the model save memories before they're lost
         self.flush_memories(messages, min_turns=0)
 
+        _before = len(messages)
         compressed = self.context_compressor.compress(messages, current_tokens=approx_tokens)
+
+        # Notify gateway/UI that compression occurred
+        if self.tool_progress_callback:
+            try:
+                self.tool_progress_callback(
+                    "_compression",
+                    f"{_before} → {len(compressed)} messages (~{approx_tokens:,} tokens)" if approx_tokens else f"{_before} → {len(compressed)} messages",
+                )
+            except Exception as e:
+                logger.debug("compression progress callback error: %s", e)
 
         todo_snapshot = self._todo_store.format_for_injection()
         if todo_snapshot:
