@@ -1042,6 +1042,7 @@ class GatewayRunner:
                             if len(_hyg_msgs) >= 4:
                                 _hyg_agent = AIAgent(
                                     **_hyg_runtime,
+                                    model=_hyg_model,
                                     max_iterations=4,
                                     quiet_mode=True,
                                     enabled_toolsets=["memory"],
