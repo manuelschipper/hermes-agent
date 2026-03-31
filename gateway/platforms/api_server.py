@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
-MAX_REQUEST_BYTES = 1_000_000  # 1 MB default limit for POST bodies
+MAX_REQUEST_BYTES = int(os.getenv("API_SERVER_MAX_BODY_MB", "50")) * 1_000_000
 
 
 def check_api_server_requirements() -> bool:
@@ -380,6 +380,8 @@ class APIServerAdapter(BasePlatformAdapter):
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
         stream_delta_callback=None,
+        tool_progress_callback=None,
+        reasoning_callback=None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -412,8 +414,131 @@ class APIServerAdapter(BasePlatformAdapter):
             session_id=session_id,
             platform="api_server",
             stream_delta_callback=stream_delta_callback,
+            tool_progress_callback=tool_progress_callback,
+            reasoning_callback=reasoning_callback,
         )
         return agent
+
+    # ------------------------------------------------------------------
+    # Multimodal content processing
+    # ------------------------------------------------------------------
+
+    async def _process_multimodal_content(self, user_message_content) -> str:
+        """Process multimodal content parts into enriched plain text.
+
+        Replicates the Telegram gateway pattern: images are described via
+        vision_analyze_tool, audio is transcribed via transcribe_audio,
+        and the results are prepended to the text content.
+        """
+        if isinstance(user_message_content, str):
+            return user_message_content
+
+        if not isinstance(user_message_content, list):
+            return str(user_message_content)
+
+        text_parts = []
+        image_descriptions = []
+        audio_transcripts = []
+
+        for part in user_message_content:
+            if not isinstance(part, dict):
+                if isinstance(part, str):
+                    text_parts.append(part)
+                continue
+
+            ptype = part.get("type", "")
+
+            if ptype in ("text", "input_text"):
+                text_parts.append(part.get("text", ""))
+            elif ptype == "image_url":
+                try:
+                    desc = await self._describe_image(part)
+                    if desc:
+                        image_descriptions.append(desc)
+                except Exception as e:
+                    logger.warning("Image processing failed: %s", e)
+                    image_descriptions.append("[The user sent an image but it could not be processed]")
+            elif ptype == "input_audio":
+                try:
+                    transcript = await self._transcribe_audio(part)
+                    if transcript:
+                        audio_transcripts.append(transcript)
+                except Exception as e:
+                    logger.warning("Audio processing failed: %s", e)
+                    audio_transcripts.append("[The user sent a voice message but it could not be processed]")
+
+        enriched = []
+        enriched.extend(image_descriptions)
+        enriched.extend(audio_transcripts)
+        enriched.extend(text_parts)
+        return "\n\n".join(p for p in enriched if p)
+
+    async def _describe_image(self, part: dict) -> Optional[str]:
+        """Describe an image_url content part using the vision tool."""
+        from tools.vision_tools import vision_analyze_tool
+
+        image_url = part.get("image_url", {})
+        url = image_url.get("url", "") if isinstance(image_url, dict) else str(image_url)
+        if not url:
+            return None
+
+        # Base64 data URI → temp file
+        if url.startswith("data:"):
+            import base64 as _b64
+            import tempfile
+            header, b64data = url.split(",", 1)
+            ext = header.split("/")[-1].split(";")[0]
+            raw = _b64.b64decode(b64data)
+            tmp = tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False)
+            tmp.write(raw)
+            tmp.close()
+            url = tmp.name
+
+        analysis_prompt = (
+            "Describe everything visible in this image in thorough detail. "
+            "Include any text, code, data, objects, people, layout, colors, "
+            "and any other notable visual information."
+        )
+        result_json = await vision_analyze_tool(image_url=url, user_prompt=analysis_prompt)
+        result = json.loads(result_json)
+        if result.get("success"):
+            description = result.get("analysis", "")
+            return (
+                f"[The user sent an image~ Here's what I can see:\n{description}]\n"
+                f"[If you need a closer look, use vision_analyze with image_url: {url} ~]"
+            )
+        return (
+            f"[The user sent an image but vision analysis failed. "
+            f"You can try vision_analyze with image_url: {url} ]"
+        )
+
+    async def _transcribe_audio(self, part: dict) -> Optional[str]:
+        """Transcribe an input_audio content part using the STT pipeline."""
+        from tools.transcription_tools import transcribe_audio
+        import base64 as _b64
+        import tempfile
+
+        audio_data = part.get("input_audio", {})
+        b64data = audio_data.get("data", "")
+        fmt = audio_data.get("format", "wav")
+        if not b64data:
+            return None
+
+        raw = _b64.b64decode(b64data)
+        tmp = tempfile.NamedTemporaryFile(suffix=f".{fmt}", delete=False)
+        tmp.write(raw)
+        tmp.close()
+
+        try:
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, lambda: transcribe_audio(tmp.name))
+        finally:
+            os.unlink(tmp.name)
+
+        if result.get("success"):
+            transcript = result.get("transcript", "")
+            return f'[The user sent a voice message~ Here\'s what they said: "{transcript}"]'
+        return f"[The user sent a voice message but transcription failed: {result.get('error', 'unknown')}]"
 
     # ------------------------------------------------------------------
     # HTTP Handlers
@@ -481,6 +606,11 @@ class APIServerAdapter(BasePlatformAdapter):
             elif role in ("user", "assistant"):
                 conversation_messages.append({"role": role, "content": content})
 
+        # Process multimodal content in the last user message
+        if conversation_messages and conversation_messages[-1].get("role") == "user":
+            last = conversation_messages[-1]
+            last["content"] = await self._process_multimodal_content(last.get("content", ""))
+
         # Extract the last user message as the primary input
         user_message = ""
         history = []
@@ -502,6 +632,8 @@ class APIServerAdapter(BasePlatformAdapter):
         if stream:
             import queue as _q
             _stream_q: _q.Queue = _q.Queue()
+            _progress_q: _q.Queue = _q.Queue()
+            _reasoning_q: _q.Queue = _q.Queue()
 
             def _on_delta(delta):
                 # Filter out None — the agent fires stream_delta_callback(None)
@@ -514,6 +646,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 if delta is not None:
                     _stream_q.put(delta)
 
+            def _on_tool_progress(tool_name, preview=None, args=None):
+                _progress_q.put({"tool": tool_name, "preview": preview or ""})
+
+            def _on_reasoning(text):
+                _reasoning_q.put(text)
+
             # Start agent in background.  agent_ref is a mutable container
             # so the SSE writer can interrupt the agent on client disconnect.
             agent_ref = [None]
@@ -523,12 +661,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 stream_delta_callback=_on_delta,
+                tool_progress_callback=_on_tool_progress,
+                reasoning_callback=_on_reasoning,
                 agent_ref=agent_ref,
             ))
 
             return await self._write_sse_chat_completion(
                 request, completion_id, model_name, created, _stream_q,
                 agent_task, agent_ref,
+                progress_q=_progress_q, reasoning_q=_reasoning_q,
             )
 
         # Non-streaming: run the agent (with optional Idempotency-Key)
@@ -592,6 +733,7 @@ class APIServerAdapter(BasePlatformAdapter):
     async def _write_sse_chat_completion(
         self, request: "web.Request", completion_id: str, model: str,
         created: int, stream_q, agent_task, agent_ref=None,
+        progress_q=None, reasoning_q=None,
     ) -> "web.StreamResponse":
         """Write real streaming SSE from agent's stream_delta_callback queue.
 
@@ -620,14 +762,42 @@ class APIServerAdapter(BasePlatformAdapter):
             }
             await response.write(f"data: {json.dumps(role_chunk)}\n\n".encode())
 
+            # Helper to drain tool progress and reasoning queues
+            async def _drain_side_queues():
+                if progress_q:
+                    while True:
+                        try:
+                            prog = progress_q.get_nowait()
+                            await response.write(
+                                f"event: tool_progress\ndata: {json.dumps(prog)}\n\n".encode()
+                            )
+                        except _q.Empty:
+                            break
+                if reasoning_q:
+                    while True:
+                        try:
+                            text = reasoning_q.get_nowait()
+                            chunk = {
+                                "id": completion_id, "object": "chat.completion.chunk",
+                                "created": created, "model": model,
+                                "choices": [{"index": 0, "delta": {"reasoning_content": text}, "finish_reason": None}],
+                            }
+                            await response.write(f"data: {json.dumps(chunk)}\n\n".encode())
+                        except _q.Empty:
+                            break
+
             # Stream content chunks as they arrive from the agent
             loop = asyncio.get_event_loop()
             while True:
+                # Drain tool progress and reasoning before checking content
+                await _drain_side_queues()
+
                 try:
                     delta = await loop.run_in_executor(None, lambda: stream_q.get(timeout=0.5))
                 except _q.Empty:
                     if agent_task.done():
-                        # Drain any remaining items
+                        # Final drain of all queues
+                        await _drain_side_queues()
                         while True:
                             try:
                                 delta = stream_q.get_nowait()
@@ -1194,6 +1364,8 @@ class APIServerAdapter(BasePlatformAdapter):
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
         stream_delta_callback=None,
+        tool_progress_callback=None,
+        reasoning_callback=None,
         agent_ref: Optional[list] = None,
     ) -> tuple:
         """
@@ -1214,6 +1386,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=ephemeral_system_prompt,
                 session_id=session_id,
                 stream_delta_callback=stream_delta_callback,
+                tool_progress_callback=tool_progress_callback,
+                reasoning_callback=reasoning_callback,
             )
             if agent_ref is not None:
                 agent_ref[0] = agent
