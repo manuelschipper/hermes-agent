@@ -21,6 +21,7 @@ Requires:
 """
 
 import asyncio
+import base64
 import hashlib
 import hmac
 import json
@@ -31,6 +32,7 @@ import re
 import sqlite3
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 try:
@@ -53,7 +55,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
-MAX_REQUEST_BYTES = 1_000_000  # 1 MB default limit for POST bodies
+MAX_REQUEST_BYTES = int(os.getenv("API_SERVER_MAX_BODY_MB", "50")) * 1_000_000
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
@@ -115,6 +117,155 @@ def _normalize_chat_content(
         return result[:MAX_NORMALIZED_TEXT_LENGTH] if len(result) > MAX_NORMALIZED_TEXT_LENGTH else result
     except Exception:
         return ""
+
+
+# ---------------------------------------------------------------------------
+# Oye document cache (mold-38)
+#
+# The upstream `document_cache` auto-mount in tools/credential_files.py has a
+# latent bug where it resolves host paths from inside the gateway container,
+# producing the wrong host path for any non-CreatBot bot (see the follow-up
+# fleet mold referenced in docs/hermes-monkey-patches.md section 1d).
+#
+# Mold-38 sidesteps that by using a separate, explicitly-mounted cache wired
+# via each bot's terminal.docker_volumes. Files land in <HERMES_HOME>/oye_documents
+# on the gateway side and are visible as /home/pn/.hermes/cache/oye-documents inside
+# the agent's terminal sandbox.
+#
+# The safety logic here (uuid12 prefix, filename sanitization, path traversal
+# guard) mirrors cache_document_from_bytes from gateway/platforms/base.py line for
+# line, just pointed at a different cache dir. A future fleet mold can collapse
+# both helpers once the auto-mount is fixed upstream.
+# ---------------------------------------------------------------------------
+
+OYE_DOCUMENT_CACHE_DIR = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))) / "oye_documents"
+OYE_SANDBOX_CACHE_PATH = "/home/pn/.hermes/cache/oye-documents"
+OYE_DOCUMENT_MAX_AGE_SECONDS = 24 * 3600
+OYE_INLINE_MAX_BYTES = 100 * 1024
+OYE_INLINE_EXTENSIONS = {".md", ".txt", ".csv", ".tsv", ".json", ".yaml", ".yml", ".xml", ".html", ".htm"}
+
+_OYE_SUPPORTED_DOCUMENT_TYPES: Dict[str, str] = {
+    ".pdf": "application/pdf",
+    ".md": "text/markdown",
+    ".txt": "text/plain",
+    ".csv": "text/csv",
+    ".tsv": "text/tab-separated-values",
+    ".json": "application/json",
+    ".yaml": "application/yaml",
+    ".yml": "application/yaml",
+    ".xml": "application/xml",
+    ".html": "text/html",
+    ".htm": "text/html",
+    ".rtf": "application/rtf",
+    ".zip": "application/zip",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".odt": "application/vnd.oasis.opendocument.text",
+    ".epub": "application/epub+zip",
+    ".ipynb": "application/x-ipynb+json",
+}
+
+
+_OYE_FILENAME_DISPLAY_RE = re.compile(r'[^\w.\- ]')
+
+
+def _safe_display_filename(filename: str) -> str:
+    """Sanitize a user-supplied filename for safe inclusion in prompt text.
+
+    Mirrors slack.py:870 and discord.py:2371. Strips characters that could
+    be used to break out of the orientation message format and inject
+    structural tokens (newlines, brackets, instruction-like sequences).
+    Filesystem safety is handled separately by _cache_oye_document; this is
+    purely for the prompt-bound display string.
+    """
+    if not filename:
+        return "document"
+    safe = _OYE_FILENAME_DISPLAY_RE.sub("_", filename)
+    safe = safe.strip()
+    return safe or "document"
+
+
+def _extract_safe_ext(filename: str) -> str:
+    """Extract a sanitized file extension, or empty string if none.
+
+    Path(filename).suffix is unsafe for prompt-bound display: for a
+    malicious filename like ``"oh.pdf]\\nIGNORE INSTRUCTIONS"``, suffix
+    returns everything after the last dot (the entire injection payload).
+    This helper enforces a strict whitelist (alnum only, max 8 chars) so
+    no control characters or newlines can survive into a prompt string,
+    and so the lookup against _OYE_SUPPORTED_DOCUMENT_TYPES is reliable.
+    """
+    if not filename or "." not in filename:
+        return ""
+    raw = filename.rsplit(".", 1)[1].lower()
+    if not raw or not raw.isalnum() or len(raw) > 8:
+        return ""
+    return "." + raw
+
+
+def _cache_oye_document(data: bytes, filename: str) -> str:
+    """Save raw document bytes to the Oye document cache and return the path.
+
+    Mirrors gateway/platforms/base.py::cache_document_from_bytes for safety:
+    uuid12 collision prefix, filename sanitization, path-traversal guard.
+    Kept inline to avoid touching base.py and broadening the patch surface.
+
+    Shared-write note: the sandbox (bots/docker/creatbot-sandbox/Dockerfile)
+    runs pn as uid 1001 so it matches the host 'dev' user the gateway runs
+    as. Both sides can write to this cache directory at standard 0o755
+    perms without any chmod gymnastics.
+    """
+    OYE_DOCUMENT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    safe_name = Path(filename).name if filename else "document"
+    safe_name = safe_name.replace("\x00", "").strip()
+    if not safe_name or safe_name in (".", ".."):
+        safe_name = "document"
+
+    cached_name = f"doc_{uuid.uuid4().hex[:12]}_{safe_name}"
+    filepath = OYE_DOCUMENT_CACHE_DIR / cached_name
+
+    if not filepath.resolve().is_relative_to(OYE_DOCUMENT_CACHE_DIR.resolve()):
+        raise ValueError(f"Path traversal rejected: {filename!r}")
+
+    filepath.write_bytes(data)
+    return str(filepath)
+
+
+def _to_sandbox_oye_path(gateway_path: str) -> str:
+    """Translate a gateway-side cache path to the sandbox-visible path.
+
+    The gateway writes to <HERMES_HOME>/oye_documents/<name>; the sandbox sees
+    the same file at /home/pn/.hermes/cache/oye-documents/<name> via the explicit
+    bind mount in terminal.docker_volumes.
+    """
+    cache_root = str(OYE_DOCUMENT_CACHE_DIR)
+    if not gateway_path.startswith(cache_root):
+        raise ValueError(
+            f"_to_sandbox_oye_path expected {cache_root} prefix, got {gateway_path!r}"
+        )
+    return gateway_path.replace(cache_root, OYE_SANDBOX_CACHE_PATH, 1)
+
+
+def _cleanup_oye_documents(max_age_seconds: int = OYE_DOCUMENT_MAX_AGE_SECONDS) -> int:
+    """Best-effort GC: prune cached files older than max_age_seconds.
+
+    Called on every cache write from _cache_oye_document's caller. Cheap at
+    expected volumes; avoids patching gateway/run.py's cron ticker.
+    """
+    if not OYE_DOCUMENT_CACHE_DIR.is_dir():
+        return 0
+    cutoff = time.time() - max_age_seconds
+    removed = 0
+    for f in OYE_DOCUMENT_CACHE_DIR.iterdir():
+        try:
+            if f.is_file() and f.stat().st_mtime < cutoff:
+                f.unlink()
+                removed += 1
+        except OSError:
+            pass
+    return removed
 
 
 def check_api_server_requirements() -> bool:
@@ -517,6 +668,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        reasoning_callback=None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -557,10 +709,203 @@ class APIServerAdapter(BasePlatformAdapter):
             tool_progress_callback=tool_progress_callback,
             tool_start_callback=tool_start_callback,
             tool_complete_callback=tool_complete_callback,
+            reasoning_callback=reasoning_callback,
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
         )
         return agent
+
+    # ------------------------------------------------------------------
+    # Multimodal content processing
+    # ------------------------------------------------------------------
+
+    async def _process_multimodal_content(self, user_message_content) -> str:
+        """Process multimodal content parts into enriched plain text.
+
+        Replicates the Telegram gateway pattern: images are described via
+        vision_analyze_tool, audio is transcribed via transcribe_audio,
+        and the results are prepended to the text content.
+        """
+        if isinstance(user_message_content, str):
+            return user_message_content
+
+        if not isinstance(user_message_content, list):
+            return str(user_message_content)
+
+        text_parts = []
+        image_descriptions = []
+        audio_transcripts = []
+        file_descriptions: List[str] = []
+
+        for part in user_message_content:
+            if not isinstance(part, dict):
+                if isinstance(part, str):
+                    text_parts.append(part)
+                continue
+
+            ptype = part.get("type", "")
+
+            if ptype in ("text", "input_text"):
+                text_parts.append(part.get("text", ""))
+            elif ptype == "image_url":
+                try:
+                    desc = await self._describe_image(part)
+                    if desc:
+                        image_descriptions.append(desc)
+                except Exception as e:
+                    logger.warning("Image processing failed: %s", e)
+                    image_descriptions.append("[The user sent an image but it could not be processed]")
+            elif ptype == "input_audio":
+                try:
+                    transcript = await self._transcribe_audio(part)
+                    if transcript:
+                        audio_transcripts.append(transcript)
+                except Exception as e:
+                    logger.warning("Audio processing failed: %s", e)
+                    audio_transcripts.append("[The user sent a voice message but it could not be processed]")
+            elif ptype == "file":
+                # mold-38: document attachments from Oye (and any other
+                # OpenAI-compatible client) as {type: file, file: {filename, file_data}}.
+                file_meta = part.get("file") or {}
+                filename = file_meta.get("filename") or "document"
+                file_data = file_meta.get("file_data") or ""
+
+                # Sanitized for prompt-bound display strings (prevents injection
+                # via newlines/brackets/etc. in user-supplied filenames).
+                # Filesystem safety is handled separately by _cache_oye_document.
+                display_name = _safe_display_filename(filename)
+
+                # data URL → bytes
+                b64data = file_data.split(",", 1)[1] if "," in file_data else file_data
+                try:
+                    raw = base64.b64decode(b64data)
+                except Exception as e:
+                    logger.warning("File decode failed for %s: %s", display_name, e)
+                    file_descriptions.append(
+                        f"[The user sent a file '{display_name}' but it could not be decoded.]"
+                    )
+                    continue
+
+                ext = _extract_safe_ext(filename)
+                if ext not in _OYE_SUPPORTED_DOCUMENT_TYPES:
+                    file_descriptions.append(
+                        f"[The user sent a file '{display_name}' (type {ext or 'unknown'}); "
+                        f"document type is not supported by the gateway.]"
+                    )
+                    continue
+
+                try:
+                    cached_path = _cache_oye_document(raw, filename)
+                except Exception as e:
+                    logger.warning("Failed to cache Oye document %s: %s", display_name, e)
+                    file_descriptions.append(
+                        f"[The user sent a file '{display_name}' but it could not be cached.]"
+                    )
+                    continue
+
+                # Best-effort GC on every write to bound the cache.
+                try:
+                    _cleanup_oye_documents()
+                except Exception as e:
+                    logger.debug("Oye document cache cleanup error: %s", e)
+
+                try:
+                    sandbox_path = _to_sandbox_oye_path(cached_path)
+                except ValueError as e:
+                    logger.warning("Oye document path translation failed: %s", e)
+                    sandbox_path = cached_path
+
+                mime = _OYE_SUPPORTED_DOCUMENT_TYPES[ext]
+                size_kb = max(1, len(raw) // 1024)
+                file_descriptions.append(
+                    f"[The user attached {display_name} ({mime}, {size_kb} KB) at {sandbox_path} — "
+                    f"read it with the terminal tool when you need to.]"
+                )
+
+                # Inline plain-text content for easy formats under 100 KB,
+                # mirroring slack.py:864-877 and discord.py:2366-2379.
+                if ext in OYE_INLINE_EXTENSIONS and len(raw) <= OYE_INLINE_MAX_BYTES:
+                    try:
+                        text_content = raw.decode("utf-8")
+                        file_descriptions.append(
+                            f"[Content of {display_name}]:\n{text_content}"
+                        )
+                    except UnicodeDecodeError:
+                        pass
+
+        enriched = []
+        enriched.extend(image_descriptions)
+        enriched.extend(audio_transcripts)
+        enriched.extend(file_descriptions)
+        enriched.extend(text_parts)
+        return "\n\n".join(p for p in enriched if p)
+
+    async def _describe_image(self, part: dict) -> Optional[str]:
+        """Describe an image_url content part using the vision tool."""
+        from tools.vision_tools import vision_analyze_tool
+
+        image_url = part.get("image_url", {})
+        url = image_url.get("url", "") if isinstance(image_url, dict) else str(image_url)
+        if not url:
+            return None
+
+        # Base64 data URI → temp file
+        if url.startswith("data:"):
+            import base64 as _b64
+            import tempfile
+            header, b64data = url.split(",", 1)
+            ext = header.split("/")[-1].split(";")[0]
+            raw = _b64.b64decode(b64data)
+            tmp = tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False)
+            tmp.write(raw)
+            tmp.close()
+            url = tmp.name
+
+        analysis_prompt = (
+            "Describe everything visible in this image in thorough detail. "
+            "Include any text, code, data, objects, people, layout, colors, "
+            "and any other notable visual information."
+        )
+        result_json = await vision_analyze_tool(image_url=url, user_prompt=analysis_prompt)
+        result = json.loads(result_json)
+        if result.get("success"):
+            description = result.get("analysis", "")
+            return (
+                f"[The user sent an image~ Here's what I can see:\n{description}]\n"
+                f"[If you need a closer look, use vision_analyze with image_url: {url} ~]"
+            )
+        return (
+            f"[The user sent an image but vision analysis failed. "
+            f"You can try vision_analyze with image_url: {url} ]"
+        )
+
+    async def _transcribe_audio(self, part: dict) -> Optional[str]:
+        """Transcribe an input_audio content part using the STT pipeline."""
+        from tools.transcription_tools import transcribe_audio
+        import base64 as _b64
+        import tempfile
+
+        audio_data = part.get("input_audio", {})
+        b64data = audio_data.get("data", "")
+        fmt = audio_data.get("format", "wav")
+        if not b64data:
+            return None
+
+        raw = _b64.b64decode(b64data)
+        tmp = tempfile.NamedTemporaryFile(suffix=f".{fmt}", delete=False)
+        tmp.write(raw)
+        tmp.close()
+
+        try:
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, lambda: transcribe_audio(tmp.name))
+        finally:
+            os.unlink(tmp.name)
+
+        if result.get("success"):
+            transcript = result.get("transcript", "")
+            return f'[The user sent a voice message~ Here\'s what they said: "{transcript}"]'
+        return f"[The user sent a voice message but transcription failed: {result.get('error', 'unknown')}]"
 
     # ------------------------------------------------------------------
     # HTTP Handlers
@@ -649,6 +994,11 @@ class APIServerAdapter(BasePlatformAdapter):
             elif role in ("user", "assistant"):
                 conversation_messages.append({"role": role, "content": content})
 
+        # Process multimodal content in the last user message
+        if conversation_messages and conversation_messages[-1].get("role") == "user":
+            last = conversation_messages[-1]
+            last["content"] = await self._process_multimodal_content(last.get("content", ""))
+
         # Extract the last user message as the primary input
         user_message = ""
         history = []
@@ -718,6 +1068,8 @@ class APIServerAdapter(BasePlatformAdapter):
         if stream:
             import queue as _q
             _stream_q: _q.Queue = _q.Queue()
+            _progress_q: _q.Queue = _q.Queue()
+            _reasoning_q: _q.Queue = _q.Queue()
 
             def _on_delta(delta):
                 # Filter out None — the agent fires stream_delta_callback(None)
@@ -730,36 +1082,58 @@ class APIServerAdapter(BasePlatformAdapter):
                 if delta is not None:
                     _stream_q.put(delta)
 
-            def _on_tool_progress(event_type, name, preview, args, **kwargs):
-                """Send tool progress as a separate SSE event.
+            def _on_tool_progress(event, name=None, preview=None, args=None, **kwargs):
+                """Push structured tool progress to compatible SSE channels.
 
-                Previously, progress markers like ``⏰ list`` were injected
-                directly into ``delta.content``.  OpenAI-compatible frontends
-                (Open WebUI, LobeChat, …) store ``delta.content`` verbatim as
-                the assistant message and send it back on subsequent requests.
-                After enough turns the model learns to *emit* the markers as
-                plain text instead of issuing real tool calls — silently
-                hallucinating tool results.  See #6972.
+                AIAgent (since upstream commit cc2b56b2) calls this with the
+                4-arg signature plus optional kwargs:
+                  tool_progress_callback("tool.started", name, preview, args)
+                  tool_progress_callback("tool.completed", name, None, None,
+                                         duration=..., is_error=...)
+                  tool_progress_callback("_thinking", first_line)
 
-                The fix: push a tagged tuple ``("__tool_progress__", payload)``
-                onto the stream queue.  The SSE writer emits it as a custom
-                ``event: hermes.tool.progress`` line that compliant frontends
-                can render for UX but will *not* persist into conversation
-                history.  Clients that don't understand the custom event type
-                silently ignore it per the SSE specification.
+                Oye's renderer (oye/cli_chat.py:_render_tool_progress and
+                oye/static/generation-store.js:appendThinkingTool) shows one
+                visual badge per emitted event with shape ``{tool, preview}``.
+                We only forward the ``tool.started`` events (which carry the
+                preview text) so each tool call surfaces as exactly one badge.
+                ``tool.completed`` events have no preview and would render as
+                duplicate empty badges, so we drop them. Errors are forwarded
+                as a single error event so failures are still visible.
+
+                The stream queue emits upstream's ``hermes.tool.progress``
+                events for generic OpenAI-compatible frontends. The progress
+                queue emits Oye's historical ``tool_progress`` events.
                 """
-                if event_type != "tool.started":
+                if event == "_thinking":
+                    return  # Skip internal thinking previews
+                if isinstance(name, str) and name.startswith("_"):
+                    return  # Skip internal tool names
+                if event == "tool.started":
+                    from agent.display import get_tool_emoji
+                    emoji = get_tool_emoji(name)
+                    label = preview or name
+                    _stream_q.put(("__tool_progress__", {
+                        "tool": name,
+                        "emoji": emoji,
+                        "label": label,
+                    }))
+                    _progress_q.put({"tool": name, "preview": preview or ""})
                     return
-                if name.startswith("_"):
+                if event == "tool.completed" and kwargs.get("is_error"):
+                    # Surface failures with a visually-distinct status preview
+                    # so it does not look like another tool invocation in Oye.
+                    duration = kwargs.get("duration")
+                    if isinstance(duration, (int, float)):
+                        status = f"✗ failed ({duration:.1f}s)"
+                    else:
+                        status = "✗ failed"
+                    _progress_q.put({"tool": name, "preview": status})
                     return
-                from agent.display import get_tool_emoji
-                emoji = get_tool_emoji(name)
-                label = preview or name
-                _stream_q.put(("__tool_progress__", {
-                    "tool": name,
-                    "emoji": emoji,
-                    "label": label,
-                }))
+                # tool.completed (success), unknown events: drop silently.
+
+            def _on_reasoning(text):
+                _reasoning_q.put(text)
 
             # Start agent in background.  agent_ref is a mutable container
             # so the SSE writer can interrupt the agent on client disconnect.
@@ -771,12 +1145,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 session_id=session_id,
                 stream_delta_callback=_on_delta,
                 tool_progress_callback=_on_tool_progress,
+                reasoning_callback=_on_reasoning,
                 agent_ref=agent_ref,
             ))
 
             return await self._write_sse_chat_completion(
                 request, completion_id, model_name, created, _stream_q,
                 agent_task, agent_ref, session_id=session_id,
+                progress_q=_progress_q, reasoning_q=_reasoning_q,
             )
 
         # Non-streaming: run the agent (with optional Idempotency-Key)
@@ -840,6 +1216,7 @@ class APIServerAdapter(BasePlatformAdapter):
     async def _write_sse_chat_completion(
         self, request: "web.Request", completion_id: str, model: str,
         created: int, stream_q, agent_task, agent_ref=None, session_id: str = None,
+        progress_q=None, reasoning_q=None,
     ) -> "web.StreamResponse":
         """Write real streaming SSE from agent's stream_delta_callback queue.
 
@@ -901,14 +1278,42 @@ class APIServerAdapter(BasePlatformAdapter):
                     await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
                 return time.monotonic()
 
+            # Helper to drain tool progress and reasoning queues
+            async def _drain_side_queues():
+                if progress_q:
+                    while True:
+                        try:
+                            prog = progress_q.get_nowait()
+                            await response.write(
+                                f"event: tool_progress\ndata: {json.dumps(prog)}\n\n".encode()
+                            )
+                        except _q.Empty:
+                            break
+                if reasoning_q:
+                    while True:
+                        try:
+                            text = reasoning_q.get_nowait()
+                            chunk = {
+                                "id": completion_id, "object": "chat.completion.chunk",
+                                "created": created, "model": model,
+                                "choices": [{"index": 0, "delta": {"reasoning_content": text}, "finish_reason": None}],
+                            }
+                            await response.write(f"data: {json.dumps(chunk)}\n\n".encode())
+                        except _q.Empty:
+                            break
+
             # Stream content chunks as they arrive from the agent
             loop = asyncio.get_running_loop()
             while True:
+                # Drain tool progress and reasoning before checking content
+                await _drain_side_queues()
+
                 try:
                     delta = await loop.run_in_executor(None, lambda: stream_q.get(timeout=0.5))
                 except _q.Empty:
                     if agent_task.done():
-                        # Drain any remaining items
+                        # Final drain of all queues
+                        await _drain_side_queues()
                         while True:
                             try:
                                 delta = stream_q.get_nowait()
@@ -1991,6 +2396,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        reasoning_callback=None,
         agent_ref: Optional[list] = None,
     ) -> tuple:
         """
@@ -2014,6 +2420,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_progress_callback=tool_progress_callback,
                 tool_start_callback=tool_start_callback,
                 tool_complete_callback=tool_complete_callback,
+                reasoning_callback=reasoning_callback,
             )
             if agent_ref is not None:
                 agent_ref[0] = agent
