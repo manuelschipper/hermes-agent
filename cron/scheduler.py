@@ -63,6 +63,31 @@ def _resolve_origin(job: dict) -> Optional[dict]:
     return None
 
 
+def _fallback_origin_from_jobs() -> Optional[dict]:
+    """Find the most recently used delivery origin from other cron jobs."""
+    try:
+        jobs_file = _hermes_home / "cron" / "jobs.json"
+        with open(jobs_file) as f:
+            data = json.load(f)
+        jobs = data.get("jobs", []) if isinstance(data, dict) else data
+        # Find the most recently delivered job with a valid origin
+        best = None
+        best_time = ""
+        for job in jobs:
+            origin = job.get("origin")
+            if not origin or not origin.get("platform") or not origin.get("chat_id"):
+                continue
+            last_run = job.get("last_run_at", "")
+            if last_run > best_time:
+                best_time = last_run
+                best = origin
+        if best:
+            logger.info("Resolved fallback origin from sibling job: %s:%s", best["platform"], best["chat_id"])
+        return best
+    except Exception:
+        return None
+
+
 def _resolve_delivery_target(job: dict) -> Optional[dict]:
     """Resolve the concrete auto-delivery target for a cron job, if any."""
     deliver = job.get("deliver", "local")
@@ -72,6 +97,8 @@ def _resolve_delivery_target(job: dict) -> Optional[dict]:
         return None
 
     if deliver == "origin":
+        if not origin:
+            origin = _fallback_origin_from_jobs()
         if not origin:
             return None
         return {
