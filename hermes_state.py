@@ -892,6 +892,65 @@ class SessionDB:
             result.append(msg)
         return result
 
+    def latest_in_lineage(self, session_id: str) -> str:
+        """Resolve a session id forward through compression continuations.
+
+        When an agent compresses context mid-run (`run_agent._compress_context`),
+        it marks the current session `end_reason='compression'`, creates a
+        new session whose `parent_session_id` points at the old one, and
+        writes subsequent messages into the new session. Clients that cache
+        the ORIGINAL session id (e.g. Oye using `chat_id` as the Hermes
+        session id) still want to read and write the "current" state of the
+        conversation — which, after compression, lives in the child.
+
+        This method walks forward through the parent_session_id chain and
+        returns the leaf id — the session that should accept new reads and
+        writes for this conversation. Callers should use the returned id
+        for both history loading AND agent session binding so that writes
+        land in the right place.
+
+        **Constraint:** the walk only follows forward when the current
+        session has `end_reason='compression'`. `parent_session_id` is
+        also used by delegated subagents (`tools/delegate_tool.py`) and
+        possibly by other branching flows; those children must NOT be
+        treated as continuations of the parent chat.
+
+        If `session_id` does not exist, it is returned as-is (the caller
+        may be about to auto-create it).
+        """
+        current = session_id
+        seen = {current}
+        while True:
+            with self._lock:
+                cur_row = self._conn.execute(
+                    "SELECT end_reason FROM sessions WHERE id = ?",
+                    (current,),
+                ).fetchone()
+            # Stop if the current session either does not exist or is not
+            # a compression-sealed parent. Non-existent: caller will
+            # auto-create. Not compression: there is no continuation to
+            # follow (subagent children must be ignored).
+            if not cur_row or cur_row["end_reason"] != "compression":
+                return current
+            with self._lock:
+                child_row = self._conn.execute(
+                    "SELECT id FROM sessions WHERE parent_session_id = ? "
+                    "ORDER BY started_at ASC LIMIT 1",
+                    (current,),
+                ).fetchone()
+            if not child_row:
+                # Compression-marked parent with no child — corrupted state
+                # (agent crashed between end_session and create_session).
+                # Return the parent so the caller at least sees SOMETHING.
+                return current
+            next_id = child_row["id"]
+            if next_id in seen:
+                # Cycle protection. Should never happen in practice but
+                # don't lock up if the DB is wonky.
+                return current
+            seen.add(next_id)
+            current = next_id
+
     def get_messages_as_conversation(self, session_id: str) -> List[Dict[str, Any]]:
         """
         Load messages in the OpenAI conversation format (role + content dicts).

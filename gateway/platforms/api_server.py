@@ -1019,6 +1019,18 @@ class APIServerAdapter(BasePlatformAdapter):
         # only allowed when the API key is configured and the request is
         # authenticated.  Without this gate, any unauthenticated client could
         # read arbitrary session history by guessing/enumerating session IDs.
+        #
+        # When the agent compresses context mid-run, it marks the current
+        # session end_reason='compression' and creates a child session that
+        # holds the compressed summary + subsequent turns. The client keeps
+        # sending the ORIGINAL id (it has no way to learn about the rotation —
+        # see SessionDB.latest_in_lineage). We resolve forward through the
+        # compression chain here so that:
+        #   - `history` loads from the leaf (the live compressed session)
+        #   - the agent is constructed with the leaf id, so writes also land
+        #     in the leaf (not back in the ended parent)
+        # We still echo `provided_session_id` back in the response header so
+        # the client sees a stable id and never has to chase rotations.
         provided_session_id = request.headers.get("X-Hermes-Session-Id", "").strip()
         if provided_session_id:
             if not self._api_key:
@@ -1044,9 +1056,16 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 db = self._ensure_session_db()
                 if db is not None:
-                    history = db.get_messages_as_conversation(session_id)
+                    effective_session_id = db.latest_in_lineage(provided_session_id)
+                    if effective_session_id != provided_session_id:
+                        logger.info(
+                            "session lineage resolved: %s -> %s",
+                            provided_session_id, effective_session_id,
+                        )
+                    history = db.get_messages_as_conversation(effective_session_id)
+                    session_id = effective_session_id
             except Exception as e:
-                logger.warning("Failed to load session history for %s: %s", session_id, e)
+                logger.warning("Failed to load session history for %s: %s", provided_session_id, e)
                 history = []
         else:
             # Derive a stable session ID from the conversation fingerprint so
@@ -1059,6 +1078,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     first_user = cm.get("content", "")
                     break
             session_id = _derive_chat_session_id(system_prompt, first_user)
+            provided_session_id = session_id
             # history already set from request body above
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
@@ -1151,7 +1171,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
             return await self._write_sse_chat_completion(
                 request, completion_id, model_name, created, _stream_q,
-                agent_task, agent_ref, session_id=session_id,
+                agent_task, agent_ref, session_id=provided_session_id,
                 progress_q=_progress_q, reasoning_q=_reasoning_q,
             )
 
@@ -1211,7 +1231,7 @@ class APIServerAdapter(BasePlatformAdapter):
             },
         }
 
-        return web.json_response(response_data, headers={"X-Hermes-Session-Id": session_id})
+        return web.json_response(response_data, headers={"X-Hermes-Session-Id": provided_session_id})
 
     async def _write_sse_chat_completion(
         self, request: "web.Request", completion_id: str, model: str,
