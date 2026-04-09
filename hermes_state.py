@@ -892,6 +892,38 @@ class SessionDB:
             result.append(msg)
         return result
 
+    def _next_compression_child(self, parent_id: str, parent_ended_at: float):
+        """Return the row for the compression continuation child of `parent_id`.
+
+        A compression-sealed parent may have multiple children in
+        `parent_session_id`: at most one is the compression continuation
+        (created in `run_agent._compress_context` immediately after
+        `end_session(..., 'compression')`), and zero or more may be
+        delegated subagents created BEFORE compression fired (via
+        `tools/delegate_tool.py`).
+
+        The compression continuation is uniquely identified by
+        `started_at >= parent.ended_at` — by construction, the
+        compression code calls `end_session` first (sets `ended_at`)
+        and `create_session` for the new child afterwards. Subagents
+        spawned during the parent's run have `started_at < parent.ended_at`
+        and are correctly excluded.
+
+        Returns the child row dict, or `None` if no compression child
+        exists (corrupted state, or the parent simply has only subagent
+        children).
+        """
+        if parent_ended_at is None:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM sessions WHERE parent_session_id = ? "
+                "AND started_at >= ? "
+                "ORDER BY started_at ASC LIMIT 1",
+                (parent_id, parent_ended_at),
+            ).fetchone()
+        return dict(row) if row else None
+
     def latest_in_lineage(self, session_id: str) -> str:
         """Resolve a session id forward through compression continuations.
 
@@ -910,10 +942,14 @@ class SessionDB:
         land in the right place.
 
         **Constraint:** the walk only follows forward when the current
-        session has `end_reason='compression'`. `parent_session_id` is
-        also used by delegated subagents (`tools/delegate_tool.py`) and
-        possibly by other branching flows; those children must NOT be
-        treated as continuations of the parent chat.
+        session has `end_reason='compression'` AND the candidate child
+        was created AFTER the parent ended. `parent_session_id` is also
+        used by delegated subagents (`tools/delegate_tool.py`); those
+        children have `started_at < parent.ended_at` and are correctly
+        excluded by the time-window constraint. (mold oye-1 corrected
+        this — the previous mold-41 walk picked the earliest child by
+        `started_at` regardless of whether it predated the compression
+        event, which would silently follow a subagent if one existed.)
 
         If `session_id` does not exist, it is returned as-is (the caller
         may be about to auto-create it).
@@ -923,7 +959,7 @@ class SessionDB:
         while True:
             with self._lock:
                 cur_row = self._conn.execute(
-                    "SELECT end_reason FROM sessions WHERE id = ?",
+                    "SELECT end_reason, ended_at FROM sessions WHERE id = ?",
                     (current,),
                 ).fetchone()
             # Stop if the current session either does not exist or is not
@@ -932,24 +968,60 @@ class SessionDB:
             # follow (subagent children must be ignored).
             if not cur_row or cur_row["end_reason"] != "compression":
                 return current
-            with self._lock:
-                child_row = self._conn.execute(
-                    "SELECT id FROM sessions WHERE parent_session_id = ? "
-                    "ORDER BY started_at ASC LIMIT 1",
-                    (current,),
-                ).fetchone()
-            if not child_row:
-                # Compression-marked parent with no child — corrupted state
-                # (agent crashed between end_session and create_session).
-                # Return the parent so the caller at least sees SOMETHING.
+            child = self._next_compression_child(current, cur_row["ended_at"])
+            if not child:
+                # Compression-marked parent with no qualifying child —
+                # corrupted state (agent crashed between end_session and
+                # create_session). Return the parent so the caller at
+                # least sees SOMETHING.
                 return current
-            next_id = child_row["id"]
+            next_id = child["id"]
             if next_id in seen:
                 # Cycle protection. Should never happen in practice but
                 # don't lock up if the DB is wonky.
                 return current
             seen.add(next_id)
             current = next_id
+
+    def walk_lineage(self, session_id: str) -> List[Dict[str, Any]]:
+        """Return the full compression-continuation chain for a session id.
+
+        Walks forward from `session_id` following the same constraint as
+        `latest_in_lineage` (parent must have `end_reason='compression'`
+        AND child must have `started_at >= parent.ended_at`), and returns
+        the ordered list of session row dicts from the original session
+        through every compression continuation to the active leaf.
+
+        The first element of the returned list is always the requested
+        session (or its row if it exists); each subsequent element is a
+        compression continuation linked via `parent_session_id`.
+
+        Returns `[]` if `session_id` does not exist in the database
+        (a normal state for `hermes_synced=1` Oye chats whose first turn
+        has not yet flushed any messages — see mold oye-1).
+
+        Subagent children are NEVER included.
+        """
+        with self._lock:
+            head_row = self._conn.execute(
+                "SELECT * FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+        if not head_row:
+            return []
+        chain: List[Dict[str, Any]] = [dict(head_row)]
+        seen = {session_id}
+        current = chain[0]
+        while current.get("end_reason") == "compression":
+            child = self._next_compression_child(current["id"], current.get("ended_at"))
+            if not child:
+                break
+            if child["id"] in seen:
+                break
+            seen.add(child["id"])
+            chain.append(child)
+            current = child
+        return chain
 
     def get_messages_as_conversation(self, session_id: str) -> List[Dict[str, Any]]:
         """

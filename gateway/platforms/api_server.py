@@ -2103,6 +2103,86 @@ class APIServerAdapter(BasePlatformAdapter):
             "deleted": True,
         })
 
+    async def _handle_session_lineage(self, request: "web.Request") -> "web.Response":
+        """GET /v1/sessions/{session_id}/lineage — compression lineage chain.
+
+        mold oye-1: Oye polls this on chat-load for `hermes_synced=1` chats
+        to find compression boundaries to surface in the UI.
+
+        Returns the full chain of session row dicts (parent → compression
+        child → ...) and a derived `compression_events` list of
+        `{at, messages_before}` ready for the UI to interleave with
+        Oye's local message timestamps.
+
+        IMPORTANT: returns HTTP 200 with EMPTY lineage and EMPTY
+        compression_events for an unknown session id. This is a normal
+        state for chats that have been created in Oye but whose first
+        turn hasn't yet flushed any messages — NOT an error. Oye still
+        defends against any non-200 by falling back to an empty list.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = request.match_info["session_id"]
+        try:
+            db = self._ensure_session_db()
+        except Exception as e:
+            logger.warning("Failed to open session db for lineage: %s", e)
+            return web.json_response({
+                "session_id": session_id,
+                "lineage": [],
+                "compression_events": [],
+            })
+        if db is None:
+            return web.json_response({
+                "session_id": session_id,
+                "lineage": [],
+                "compression_events": [],
+            })
+
+        try:
+            chain = db.walk_lineage(session_id)
+        except Exception as e:
+            logger.warning("walk_lineage(%s) failed: %s", session_id, e)
+            return web.json_response({
+                "session_id": session_id,
+                "lineage": [],
+                "compression_events": [],
+            })
+
+        # Trim each row to the fields the UI needs.
+        lineage = [
+            {
+                "id": row.get("id"),
+                "parent_session_id": row.get("parent_session_id"),
+                "started_at": row.get("started_at"),
+                "ended_at": row.get("ended_at"),
+                "end_reason": row.get("end_reason"),
+                "message_count": row.get("message_count") or 0,
+            }
+            for row in chain
+        ]
+
+        # Derive the per-event list. A compression event happens at the
+        # transition between two adjacent rows in the chain (parent's
+        # ended_at). The very first row (the root) has no preceding event,
+        # and the last row (the active leaf) has no following event.
+        compression_events = []
+        for row in chain[:-1]:  # every row except the leaf has a transition
+            if row.get("end_reason") != "compression":
+                continue
+            compression_events.append({
+                "at": row.get("ended_at"),
+                "messages_before": row.get("message_count") or 0,
+            })
+
+        return web.json_response({
+            "session_id": session_id,
+            "lineage": lineage,
+            "compression_events": compression_events,
+        })
+
     # ------------------------------------------------------------------
     # Cron jobs API
     # ------------------------------------------------------------------
@@ -2748,6 +2828,8 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/v1/responses", self._handle_responses)
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
             self._app.router.add_delete("/v1/responses/{response_id}", self._handle_delete_response)
+            # mold oye-1: lineage of compression continuations for a session id
+            self._app.router.add_get("/v1/sessions/{session_id}/lineage", self._handle_session_lineage)
             # Cron jobs management API
             self._app.router.add_get("/api/jobs", self._handle_list_jobs)
             self._app.router.add_post("/api/jobs", self._handle_create_job)

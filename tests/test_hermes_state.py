@@ -1541,3 +1541,150 @@ class TestConcurrentWriteSafety:
         assert "30" in src, (
             "SQLite timeout should be at least 30s to handle CLI/gateway lock contention"
         )
+
+
+# =========================================================================
+# Compression lineage walk
+# Covers mold-41 (latest_in_lineage) + mold oye-1 (walk_lineage + the
+# subagent-vs-compression-child fix in latest_in_lineage).
+# =========================================================================
+
+class TestCompressionLineage:
+    def _seal_with_compression(self, db, session_id, ended_at):
+        """Helper: end the session with reason='compression' at a given time."""
+        with db._lock:
+            db._conn.execute(
+                "UPDATE sessions SET ended_at = ?, end_reason = 'compression' WHERE id = ?",
+                (ended_at, session_id),
+            )
+            db._conn.commit()
+
+    def _set_started_at(self, db, session_id, started_at):
+        """Helper: backdate a session's started_at for ordering tests."""
+        with db._lock:
+            db._conn.execute(
+                "UPDATE sessions SET started_at = ? WHERE id = ?",
+                (started_at, session_id),
+            )
+            db._conn.commit()
+
+    def test_latest_in_lineage_no_children(self, db):
+        """A session with no children resolves to itself."""
+        db.create_session(session_id="solo", source="cli")
+        assert db.latest_in_lineage("solo") == "solo"
+
+    def test_latest_in_lineage_unknown_session_returned_as_is(self, db):
+        """An unknown id is returned unchanged (caller may auto-create)."""
+        assert db.latest_in_lineage("nonexistent") == "nonexistent"
+
+    def test_walk_lineage_unknown_session_returns_empty(self, db):
+        """walk_lineage on an unknown id returns an empty list (NOT an error)."""
+        assert db.walk_lineage("nonexistent") == []
+
+    def test_latest_in_lineage_one_compression_hop(self, db):
+        """parent (compression) -> child should resolve to child."""
+        db.create_session(session_id="p", source="cli")
+        self._set_started_at(db, "p", 1000.0)
+        self._seal_with_compression(db, "p", ended_at=2000.0)
+        db.create_session(session_id="c1", source="cli", parent_session_id="p")
+        self._set_started_at(db, "c1", 2000.5)
+        assert db.latest_in_lineage("p") == "c1"
+
+    def test_walk_lineage_one_compression_hop(self, db):
+        """walk_lineage returns [parent, child] in order."""
+        db.create_session(session_id="p", source="cli")
+        self._set_started_at(db, "p", 1000.0)
+        self._seal_with_compression(db, "p", ended_at=2000.0)
+        db.create_session(session_id="c1", source="cli", parent_session_id="p")
+        self._set_started_at(db, "c1", 2000.5)
+        chain = db.walk_lineage("p")
+        assert [row["id"] for row in chain] == ["p", "c1"]
+
+    def test_latest_in_lineage_two_compression_hops(self, db):
+        """parent -> mid -> leaf, walk should return the leaf."""
+        db.create_session(session_id="p", source="cli")
+        self._set_started_at(db, "p", 1000.0)
+        self._seal_with_compression(db, "p", ended_at=2000.0)
+        db.create_session(session_id="m", source="cli", parent_session_id="p")
+        self._set_started_at(db, "m", 2000.5)
+        self._seal_with_compression(db, "m", ended_at=3000.0)
+        db.create_session(session_id="leaf", source="cli", parent_session_id="m")
+        self._set_started_at(db, "leaf", 3000.5)
+        assert db.latest_in_lineage("p") == "leaf"
+
+    def test_walk_lineage_two_compression_hops(self, db):
+        """walk_lineage returns the full 3-element chain in order."""
+        db.create_session(session_id="p", source="cli")
+        self._set_started_at(db, "p", 1000.0)
+        self._seal_with_compression(db, "p", ended_at=2000.0)
+        db.create_session(session_id="m", source="cli", parent_session_id="p")
+        self._set_started_at(db, "m", 2000.5)
+        self._seal_with_compression(db, "m", ended_at=3000.0)
+        db.create_session(session_id="leaf", source="cli", parent_session_id="m")
+        self._set_started_at(db, "leaf", 3000.5)
+        chain = db.walk_lineage("p")
+        assert [row["id"] for row in chain] == ["p", "m", "leaf"]
+
+    def test_latest_in_lineage_skips_subagent_child(self, db):
+        """mold oye-1 regression test for the latest_in_lineage tightening.
+
+        A parent with a delegated subagent child created BEFORE
+        compression and a compression child created AFTER must resolve
+        to the compression child, NOT the subagent. The previous
+        mold-41 walk picked the earliest child by `started_at` ASC and
+        would have erroneously followed the subagent.
+        """
+        db.create_session(session_id="p", source="cli")
+        self._set_started_at(db, "p", 1000.0)
+        # Subagent created at T=1500, BEFORE the parent compresses at T=2000.
+        db.create_session(session_id="subagent", source="cli", parent_session_id="p")
+        self._set_started_at(db, "subagent", 1500.0)
+        # Now seal the parent with compression at T=2000.
+        self._seal_with_compression(db, "p", ended_at=2000.0)
+        # Compression child created right after (T=2000.5).
+        db.create_session(session_id="compression_child", source="cli", parent_session_id="p")
+        self._set_started_at(db, "compression_child", 2000.5)
+        # Walk MUST pick compression_child, NOT subagent.
+        assert db.latest_in_lineage("p") == "compression_child"
+
+    def test_walk_lineage_skips_subagent_child(self, db):
+        """walk_lineage applies the same time-window constraint."""
+        db.create_session(session_id="p", source="cli")
+        self._set_started_at(db, "p", 1000.0)
+        db.create_session(session_id="subagent", source="cli", parent_session_id="p")
+        self._set_started_at(db, "subagent", 1500.0)
+        self._seal_with_compression(db, "p", ended_at=2000.0)
+        db.create_session(session_id="compression_child", source="cli", parent_session_id="p")
+        self._set_started_at(db, "compression_child", 2000.5)
+        chain = db.walk_lineage("p")
+        # Subagent must NOT appear in the chain.
+        ids = [row["id"] for row in chain]
+        assert "subagent" not in ids
+        assert ids == ["p", "compression_child"]
+
+    def test_latest_in_lineage_stops_at_non_compression_end(self, db):
+        """A session ended for a non-compression reason stops the walk."""
+        db.create_session(session_id="p", source="cli")
+        with db._lock:
+            db._conn.execute(
+                "UPDATE sessions SET ended_at = ?, end_reason = 'user_exit' WHERE id = ?",
+                (2000.0, "p"),
+            )
+            db._conn.commit()
+        db.create_session(session_id="c1", source="cli", parent_session_id="p")
+        self._set_started_at(db, "c1", 2000.5)
+        # Even though c1 is later, the walk doesn't follow it because
+        # p's end_reason is not 'compression'.
+        assert db.latest_in_lineage("p") == "p"
+
+    def test_latest_in_lineage_compression_marked_but_no_child(self, db):
+        """A corrupted state (compression-marked parent with no qualifying child)
+        returns the parent rather than failing."""
+        db.create_session(session_id="p", source="cli")
+        self._set_started_at(db, "p", 1000.0)
+        self._seal_with_compression(db, "p", ended_at=2000.0)
+        # No child created.
+        assert db.latest_in_lineage("p") == "p"
+        # walk_lineage returns just [p] in this corrupted case.
+        chain = db.walk_lineage("p")
+        assert [row["id"] for row in chain] == ["p"]
