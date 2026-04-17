@@ -984,7 +984,8 @@ class APIServerAdapter(BasePlatformAdapter):
 
         for msg in messages:
             role = msg.get("role", "")
-            content = _normalize_chat_content(msg.get("content", ""))
+            raw_content = msg.get("content", "")
+            content = _normalize_chat_content(raw_content)
             if role == "system":
                 # Accumulate system messages
                 if system_prompt is None:
@@ -992,7 +993,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 else:
                     system_prompt = system_prompt + "\n" + content
             elif role in ("user", "assistant"):
-                conversation_messages.append({"role": role, "content": content})
+                # Preserve raw multimodal user content so the last-turn
+                # preprocessing step can still inspect image/audio/file parts.
+                stored_content = raw_content if role == "user" and isinstance(raw_content, list) else content
+                conversation_messages.append({"role": role, "content": stored_content})
 
         # Process multimodal content in the last user message
         if conversation_messages and conversation_messages[-1].get("role") == "user":
@@ -2818,7 +2822,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         try:
             mws = [mw for mw in (cors_middleware, body_limit_middleware, security_headers_middleware) if mw is not None]
-            self._app = web.Application(middlewares=mws)
+            self._app = web.Application(middlewares=mws, client_max_size=MAX_REQUEST_BYTES)
             self._app["api_server_adapter"] = self
             self._app.router.add_get("/health", self._handle_health)
             self._app.router.add_get("/health/detailed", self._handle_health_detailed)

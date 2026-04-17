@@ -30,6 +30,8 @@ from gateway.platforms.api_server import (
     check_api_server_requirements,
     cors_middleware,
     security_headers_middleware,
+    body_limit_middleware,
+    MAX_REQUEST_BYTES,
 )
 
 
@@ -216,8 +218,8 @@ def _make_adapter(api_key: str = "", cors_origins=None) -> APIServerAdapter:
 
 def _create_app(adapter: APIServerAdapter) -> web.Application:
     """Create the aiohttp app from the adapter (without starting the full server)."""
-    mws = [mw for mw in (cors_middleware, security_headers_middleware) if mw is not None]
-    app = web.Application(middlewares=mws)
+    mws = [mw for mw in (cors_middleware, body_limit_middleware, security_headers_middleware) if mw is not None]
+    app = web.Application(middlewares=mws, client_max_size=MAX_REQUEST_BYTES)
     app["api_server_adapter"] = adapter
     app.router.add_get("/health", adapter._handle_health)
     app.router.add_get("/health/detailed", adapter._handle_health_detailed)
@@ -434,6 +436,41 @@ class TestChatCompletionsEndpoint:
         async with TestClient(TestServer(app)) as cli:
             resp = await cli.post("/v1/chat/completions", json={"model": "test", "messages": []})
             assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_large_input_audio_request_is_accepted(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            audio_payload = "A" * (2 * 1024 * 1024)
+
+            with patch.object(adapter, "_process_multimodal_content", AsyncMock(return_value="voice transcript")) as mock_process, \
+                 patch.object(
+                     adapter,
+                     "_run_agent",
+                     AsyncMock(return_value=({"final_response": "ok", "messages": [], "api_calls": 1}, {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2})),
+                 ) as mock_run:
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "input_audio", "input_audio": {"data": audio_payload, "format": "webm"}}
+                                ],
+                            }
+                        ],
+                    },
+                )
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["choices"][0]["message"]["content"] == "ok"
+                mock_process.assert_awaited_once()
+                assert mock_process.await_args.args[0] == [
+                    {"type": "input_audio", "input_audio": {"data": audio_payload, "format": "webm"}}
+                ]
+                mock_run.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_stream_true_returns_sse(self, adapter):
@@ -2012,6 +2049,7 @@ class TestSessionIdHeader:
         """When X-Hermes-Session-Id is provided, it's passed to the agent and echoed in the response."""
         mock_result = {"final_response": "Continuing!", "messages": [], "api_calls": 1}
         mock_db = MagicMock()
+        mock_db.latest_in_lineage.return_value = "my-session-123"
         mock_db.get_messages_as_conversation.return_value = [
             {"role": "user", "content": "previous message"},
             {"role": "assistant", "content": "previous reply"},
