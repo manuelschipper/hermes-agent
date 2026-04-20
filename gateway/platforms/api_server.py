@@ -1092,7 +1092,6 @@ class APIServerAdapter(BasePlatformAdapter):
         if stream:
             import queue as _q
             _stream_q: _q.Queue = _q.Queue()
-            _progress_q: _q.Queue = _q.Queue()
             _reasoning_q: _q.Queue = _q.Queue()
 
             def _on_delta(delta):
@@ -1107,7 +1106,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     _stream_q.put(delta)
 
             def _on_tool_progress(event, name=None, preview=None, args=None, **kwargs):
-                """Push structured tool progress to compatible SSE channels.
+                """Push structured tool progress to the native SSE channel.
 
                 AIAgent (since upstream commit cc2b56b2) calls this with the
                 4-arg signature plus optional kwargs:
@@ -1116,18 +1115,13 @@ class APIServerAdapter(BasePlatformAdapter):
                                          duration=..., is_error=...)
                   tool_progress_callback("_thinking", first_line)
 
-                Oye's renderer (oye/cli_chat.py:_render_tool_progress and
-                oye/static/generation-store.js:appendThinkingTool) shows one
-                visual badge per emitted event with shape ``{tool, preview}``.
-                We only forward the ``tool.started`` events (which carry the
-                preview text) so each tool call surfaces as exactly one badge.
-                ``tool.completed`` events have no preview and would render as
-                duplicate empty badges, so we drop them. Errors are forwarded
-                as a single error event so failures are still visible.
-
-                The stream queue emits upstream's ``hermes.tool.progress``
-                events for generic OpenAI-compatible frontends. The progress
-                queue emits Oye's historical ``tool_progress`` events.
+                ``tool.started`` events carry the preview text and are emitted
+                once as ``event: hermes.tool.progress`` so frontends can show
+                tool activity without persisting markers in assistant text.
+                ``tool.completed`` success events have no preview and would
+                render as duplicate empty badges, so we drop them. Failures are
+                forwarded as a single native progress event so they remain
+                visible without the legacy Oye ``tool_progress`` SSE channel.
                 """
                 if event == "_thinking":
                     return  # Skip internal thinking previews
@@ -1142,17 +1136,22 @@ class APIServerAdapter(BasePlatformAdapter):
                         "emoji": emoji,
                         "label": label,
                     }))
-                    _progress_q.put({"tool": name, "preview": preview or ""})
                     return
                 if event == "tool.completed" and kwargs.get("is_error"):
                     # Surface failures with a visually-distinct status preview
                     # so it does not look like another tool invocation in Oye.
+                    from agent.display import get_tool_emoji
+                    emoji = get_tool_emoji(name)
                     duration = kwargs.get("duration")
                     if isinstance(duration, (int, float)):
                         status = f"✗ failed ({duration:.1f}s)"
                     else:
                         status = "✗ failed"
-                    _progress_q.put({"tool": name, "preview": status})
+                    _stream_q.put(("__tool_progress__", {
+                        "tool": name,
+                        "emoji": emoji,
+                        "label": status,
+                    }))
                     return
                 # tool.completed (success), unknown events: drop silently.
 
@@ -1176,7 +1175,7 @@ class APIServerAdapter(BasePlatformAdapter):
             return await self._write_sse_chat_completion(
                 request, completion_id, model_name, created, _stream_q,
                 agent_task, agent_ref, session_id=provided_session_id,
-                progress_q=_progress_q, reasoning_q=_reasoning_q,
+                reasoning_q=_reasoning_q,
             )
 
         # Non-streaming: run the agent (with optional Idempotency-Key)
@@ -1240,7 +1239,7 @@ class APIServerAdapter(BasePlatformAdapter):
     async def _write_sse_chat_completion(
         self, request: "web.Request", completion_id: str, model: str,
         created: int, stream_q, agent_task, agent_ref=None, session_id: str = None,
-        progress_q=None, reasoning_q=None,
+        reasoning_q=None,
     ) -> "web.StreamResponse":
         """Write real streaming SSE from agent's stream_delta_callback queue.
 
@@ -1302,17 +1301,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     await response.write(f"data: {json.dumps(content_chunk)}\n\n".encode())
                 return time.monotonic()
 
-            # Helper to drain tool progress and reasoning queues
+            # Helper to drain reasoning side queue
             async def _drain_side_queues():
-                if progress_q:
-                    while True:
-                        try:
-                            prog = progress_q.get_nowait()
-                            await response.write(
-                                f"event: tool_progress\ndata: {json.dumps(prog)}\n\n".encode()
-                            )
-                        except _q.Empty:
-                            break
                 if reasoning_q:
                     while True:
                         try:

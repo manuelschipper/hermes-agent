@@ -628,6 +628,7 @@ class TestChatCompletionsEndpoint:
                 # delta.content — prevents model from learning to imitate
                 # markers instead of calling tools (#6972).
                 assert "event: hermes.tool.progress" in body
+                assert "event: tool_progress" not in body
                 assert '"tool": "terminal"' in body
                 assert '"label": "ls -la"' in body
                 # The progress marker must NOT appear inside any
@@ -683,8 +684,46 @@ class TestChatCompletionsEndpoint:
                 assert "some internal state" not in body
                 # Real tool progress should appear as custom SSE event
                 assert "event: hermes.tool.progress" in body
+                assert "event: tool_progress" not in body
                 assert '"tool": "web_search"' in body
                 assert '"label": "Python docs"' in body
+
+    @pytest.mark.asyncio
+    async def test_stream_tool_progress_errors_use_native_event_only(self, adapter):
+        """Tool failures are streamed through hermes.tool.progress, not legacy tool_progress."""
+        import asyncio
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("stream_delta_callback")
+                tp_cb = kwargs.get("tool_progress_callback")
+                if tp_cb:
+                    tp_cb("tool.completed", "terminal", None, None, duration=1.25, is_error=True)
+                if cb:
+                    await asyncio.sleep(0.05)
+                    cb("The command failed.")
+                return (
+                    {"final_response": "The command failed.", "messages": [], "api_calls": 1},
+                    {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "run command"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+                assert "event: hermes.tool.progress" in body
+                assert "event: tool_progress" not in body
+                assert '"tool": "terminal"' in body
+                assert '"label": "\\u2717 failed (1.2s)"' in body
+                assert "The command failed." in body
 
     @pytest.mark.asyncio
     async def test_no_user_message_returns_400(self, adapter):
