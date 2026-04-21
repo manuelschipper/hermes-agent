@@ -646,6 +646,56 @@ class TestChatCompletionsEndpoint:
                 assert " about it..." in body
 
     @pytest.mark.asyncio
+    async def test_stream_includes_reasoning_content(self, adapter):
+        """reasoning_callback fires → reasoning appears outside delta.content."""
+        import asyncio
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                reasoning_cb = kwargs.get("reasoning_callback")
+                cb = kwargs.get("stream_delta_callback")
+                if reasoning_cb:
+                    reasoning_cb("I should inspect the request first.")
+                if cb:
+                    await asyncio.sleep(0.05)
+                    cb("The answer is 42.")
+                return (
+                    {"final_response": "The answer is 42.", "messages": [], "api_calls": 1},
+                    {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "answer"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+                assert "[DONE]" in body
+                assert "The answer is 42." in body
+                assert "I should inspect the request first." in body
+
+                saw_reasoning = False
+                for line in body.splitlines():
+                    if not line.startswith("data: ") or line.strip() == "data: [DONE]":
+                        continue
+                    chunk = json.loads(line[len("data: "):])
+                    if chunk.get("object") != "chat.completion.chunk":
+                        continue
+                    for choice in chunk.get("choices", []):
+                        delta = choice.get("delta", {})
+                        assert "I should inspect the request first." not in delta.get("content", "")
+                        if delta.get("reasoning_content") == "I should inspect the request first.":
+                            saw_reasoning = True
+
+                assert saw_reasoning
+
+    @pytest.mark.asyncio
     async def test_stream_includes_tool_progress(self, adapter):
         """tool_progress_callback fires → progress appears as custom SSE event, not in delta.content."""
         import asyncio
