@@ -22,6 +22,8 @@ Requires:
 """
 
 import asyncio
+import base64
+import binascii
 import hashlib
 import hmac
 import json
@@ -30,8 +32,10 @@ import os
 import socket as _socket
 import re
 import sqlite3
+import tempfile
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 try:
@@ -54,7 +58,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
-MAX_REQUEST_BYTES = 1_000_000  # 1 MB default limit for POST bodies
+MAX_REQUEST_BYTES = int(os.getenv("API_SERVER_MAX_BODY_MB", "50")) * 1_000_000
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
@@ -125,13 +129,90 @@ def _normalize_chat_content(
 _TEXT_PART_TYPES = frozenset({"text", "input_text", "output_text"})
 _IMAGE_PART_TYPES = frozenset({"image_url", "input_image"})
 _FILE_PART_TYPES = frozenset({"file", "input_file"})
+_AUDIO_PART_TYPES = frozenset({"input_audio"})
 
 
-def _normalize_multimodal_content(content: Any) -> Any:
+def _normalize_input_audio_format(format_value: Any) -> str:
+    """Return a safe audio extension name without a leading dot."""
+    if format_value is None:
+        audio_format = "wav"
+    elif isinstance(format_value, str):
+        audio_format = format_value.strip().lower()
+    else:
+        raise ValueError("invalid_content_part:Audio format must be a non-empty string when provided.")
+
+    if audio_format.startswith("."):
+        audio_format = audio_format[1:]
+
+    if (
+        not audio_format
+        or "/" in audio_format
+        or "\\" in audio_format
+        or "." in audio_format
+        or not re.fullmatch(r"[a-z0-9]+", audio_format)
+    ):
+        raise ValueError("invalid_content_part:Audio format must be a safe file extension.")
+
+    from tools.transcription_tools import SUPPORTED_FORMATS
+
+    extension = f".{audio_format}"
+    if extension not in SUPPORTED_FORMATS:
+        supported = ", ".join(sorted(fmt.lstrip(".") for fmt in SUPPORTED_FORMATS))
+        raise ValueError(
+            f"unsupported_content_type:Unsupported audio format {audio_format!r}. "
+            f"Supported formats: {supported}."
+        )
+
+    return audio_format
+
+
+def _decode_input_audio_payload(part: Dict[str, Any]) -> tuple[bytes, str]:
+    """Validate and decode an OpenAI ``input_audio`` content part."""
+    audio = part.get("input_audio")
+    if not isinstance(audio, dict):
+        raise ValueError("invalid_content_part:Audio parts must include an input_audio object.")
+
+    data = audio.get("data")
+    if not isinstance(data, str) or not data.strip():
+        raise ValueError("invalid_content_part:Audio parts must include non-empty base64 data.")
+
+    audio_format = _normalize_input_audio_format(audio.get("format", "wav"))
+
+    try:
+        raw = base64.b64decode(data.strip(), validate=True)
+    except (binascii.Error, ValueError):
+        raise ValueError("invalid_content_part:Audio data must be valid base64.") from None
+
+    from tools.transcription_tools import MAX_FILE_SIZE
+
+    if len(raw) > MAX_FILE_SIZE:
+        raise ValueError("unsupported_content_type:Audio input is too large for transcription.")
+
+    return raw, audio_format
+
+
+def _normalize_input_audio_part(part: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate an audio part and emit the canonical API-server shape."""
+    _, audio_format = _decode_input_audio_payload(part)
+    audio = part["input_audio"]
+    return {
+        "type": "input_audio",
+        "input_audio": {"data": audio["data"].strip(), "format": audio_format},
+    }
+
+
+def _normalize_multimodal_content(
+    content: Any,
+    *,
+    allow_audio: bool = False,
+    allow_local_inputs: bool = False,
+) -> Any:
     """Validate and normalize multimodal content for the API server.
 
     Returns a plain string when the content is text-only, or a list of
     ``{"type": "text"|"image_url", ...}`` parts when images are present.
+    When ``allow_audio`` is true, validated ``input_audio`` parts can also be
+    retained for the Chat Completions handler to transcribe before agent entry.
     The output shape is the native OpenAI Chat Completions vision format,
     which the agent pipeline accepts verbatim (OpenAI-wire providers) or
     converts (``_preprocess_anthropic_content`` for Anthropic).
@@ -140,9 +221,13 @@ def _normalize_multimodal_content(content: Any) -> Any:
       * ``unsupported_content_type`` — file/input_file/file_id parts, or
         non-image ``data:`` URLs.
       * ``invalid_image_url`` — missing URL or unsupported scheme.
-      * ``invalid_content_part`` — malformed text/image objects.
+      * ``invalid_content_part`` — malformed text/image/audio objects.
 
     Callers translate the ValueError into a 400 response.
+
+    ``allow_local_inputs`` is used by the chat-completions gateway path to
+    accept Oye document parts that are converted before the agent sees them.
+    Responses API keeps upstream's stricter contract.
     """
     # Scalar passthrough mirrors ``_normalize_chat_content``.
     if content is None:
@@ -220,17 +305,49 @@ def _normalize_multimodal_content(content: Any) -> Any:
             normalized_parts.append(image_part)
             continue
 
+        if part_type in _AUDIO_PART_TYPES:
+            if allow_audio:
+                normalized_parts.append(_normalize_input_audio_part(part))
+                continue
+            raise ValueError(
+                "unsupported_content_type:Audio inputs are supported only for the "
+                "latest user message on the Chat Completions endpoint."
+            )
+
+        if part_type == "file" and allow_local_inputs:
+            file_meta = part.get("file")
+            if not isinstance(file_meta, dict):
+                raise ValueError("invalid_content_part:File parts must include a file object.")
+            if file_meta.get("file_id"):
+                raise ValueError(
+                    "unsupported_content_type:Inline file_data is supported, but uploaded file IDs are not."
+                )
+            file_data = file_meta.get("file_data")
+            if not isinstance(file_data, str) or not file_data.strip():
+                raise ValueError("invalid_content_part:File parts must include non-empty file_data.")
+            filename = file_meta.get("filename") or "document"
+            normalized_parts.append({
+                "type": "file",
+                "file": {"filename": str(filename), "file_data": file_data},
+            })
+            continue
+
         if part_type in _FILE_PART_TYPES:
             raise ValueError(
                 "unsupported_content_type:Inline image inputs are supported, "
-                "but uploaded files and document inputs are not supported on this endpoint."
+                "but uploaded files, documents, and audio inputs are not supported on this endpoint."
             )
 
         # Unknown part type — reject explicitly so clients get a clear error
         # instead of a silently dropped turn.
+        allowed = (
+            "Only text, image_url/input_image, and input_audio parts are supported."
+            if allow_audio
+            else "Only text and image_url/input_image parts are supported."
+        )
         raise ValueError(
             f"unsupported_content_type:Unsupported content part type {raw_type!r}. "
-            "Only text and image_url/input_image parts are supported."
+            f"{allowed}"
         )
 
     if not normalized_parts:
@@ -246,7 +363,7 @@ def _normalize_multimodal_content(content: Any) -> Any:
 
 
 def _content_has_visible_payload(content: Any) -> bool:
-    """True when content has any text or image attachment.  Used to reject empty turns."""
+    """True when content has any visible text or supported attachment."""
     if isinstance(content, str):
         return bool(content.strip())
     if isinstance(content, list):
@@ -257,7 +374,91 @@ def _content_has_visible_payload(content: Any) -> bool:
                     return True
                 if ptype in _IMAGE_PART_TYPES:
                     return True
+                if ptype in _AUDIO_PART_TYPES or ptype == "file":
+                    return True
     return False
+
+
+OYE_DOCUMENT_CACHE_DIR = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))) / "oye_documents"
+OYE_SANDBOX_CACHE_PATH = "/home/pn/.hermes/cache/oye-documents"
+OYE_DOCUMENT_MAX_AGE_SECONDS = 24 * 3600
+OYE_INLINE_MAX_BYTES = 100 * 1024
+OYE_INLINE_EXTENSIONS = {".md", ".txt", ".csv", ".tsv", ".json", ".yaml", ".yml", ".xml", ".html", ".htm"}
+
+_OYE_SUPPORTED_DOCUMENT_TYPES: Dict[str, str] = {
+    ".pdf": "application/pdf",
+    ".md": "text/markdown",
+    ".txt": "text/plain",
+    ".csv": "text/csv",
+    ".tsv": "text/tab-separated-values",
+    ".json": "application/json",
+    ".yaml": "application/yaml",
+    ".yml": "application/yaml",
+    ".xml": "application/xml",
+    ".html": "text/html",
+    ".htm": "text/html",
+    ".rtf": "application/rtf",
+    ".zip": "application/zip",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".odt": "application/vnd.oasis.opendocument.text",
+    ".epub": "application/epub+zip",
+    ".ipynb": "application/x-ipynb+json",
+}
+
+_OYE_FILENAME_DISPLAY_RE = re.compile(r'[^\w.\- ]')
+
+
+def _safe_display_filename(filename: str) -> str:
+    safe = _OYE_FILENAME_DISPLAY_RE.sub("_", filename or "document").strip()
+    return safe or "document"
+
+
+def _extract_safe_ext(filename: str) -> str:
+    if not filename or "." not in filename:
+        return ""
+    raw = filename.rsplit(".", 1)[1].lower()
+    if not raw or not raw.isalnum() or len(raw) > 8:
+        return ""
+    return "." + raw
+
+
+def _cache_oye_document(data: bytes, filename: str) -> str:
+    OYE_DOCUMENT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    safe_name = Path(filename).name if filename else "document"
+    safe_name = safe_name.replace("\x00", "").strip()
+    if not safe_name or safe_name in (".", ".."):
+        safe_name = "document"
+
+    filepath = OYE_DOCUMENT_CACHE_DIR / f"doc_{uuid.uuid4().hex[:12]}_{safe_name}"
+    if not filepath.resolve().is_relative_to(OYE_DOCUMENT_CACHE_DIR.resolve()):
+        raise ValueError(f"Path traversal rejected: {filename!r}")
+    filepath.write_bytes(data)
+    return str(filepath)
+
+
+def _to_sandbox_oye_path(gateway_path: str) -> str:
+    cache_root = str(OYE_DOCUMENT_CACHE_DIR)
+    if not gateway_path.startswith(cache_root):
+        raise ValueError(f"_to_sandbox_oye_path expected {cache_root} prefix, got {gateway_path!r}")
+    return gateway_path.replace(cache_root, OYE_SANDBOX_CACHE_PATH, 1)
+
+
+def _cleanup_oye_documents(max_age_seconds: int = OYE_DOCUMENT_MAX_AGE_SECONDS) -> int:
+    if not OYE_DOCUMENT_CACHE_DIR.is_dir():
+        return 0
+    cutoff = time.time() - max_age_seconds
+    removed = 0
+    for path in OYE_DOCUMENT_CACHE_DIR.iterdir():
+        try:
+            if path.is_file() and path.stat().st_mtime < cutoff:
+                path.unlink()
+                removed += 1
+        except OSError:
+            continue
+    return removed
 
 
 def _multimodal_validation_error(exc: ValueError, *, param: str) -> "web.Response":
@@ -713,6 +914,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        reasoning_callback=None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -753,10 +955,148 @@ class APIServerAdapter(BasePlatformAdapter):
             tool_progress_callback=tool_progress_callback,
             tool_start_callback=tool_start_callback,
             tool_complete_callback=tool_complete_callback,
+            reasoning_callback=reasoning_callback,
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
         )
         return agent
+
+    # ------------------------------------------------------------------
+    # Audio and local input processing
+    # ------------------------------------------------------------------
+
+    async def _process_input_audio_parts(self, content: Any) -> Any:
+        """Transcribe validated input_audio parts before AIAgent sees content."""
+        if not isinstance(content, list):
+            return content
+
+        output_parts: List[Dict[str, Any]] = []
+
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            ptype = str(part.get("type") or "").strip().lower()
+            if ptype in _TEXT_PART_TYPES or ptype in _IMAGE_PART_TYPES or ptype == "file":
+                output_parts.append(part)
+                continue
+            if ptype in _AUDIO_PART_TYPES:
+                try:
+                    text = await self._transcribe_input_audio_part(part)
+                except ValueError:
+                    raise
+                except Exception as exc:
+                    logger.warning("Audio processing failed: %s", exc)
+                    text = "[The user sent a voice message but it could not be processed.]"
+                output_parts.append({"type": "text", "text": text})
+
+        if not output_parts:
+            return ""
+        if all(p.get("type") == "text" for p in output_parts):
+            return "\n\n".join(str(p.get("text", "")) for p in output_parts if p.get("text"))
+        return output_parts
+
+    async def _transcribe_input_audio_part(self, part: Dict[str, Any]) -> str:
+        """Transcribe one input_audio part through the existing STT pipeline."""
+        from tools.transcription_tools import transcribe_audio
+
+        raw, audio_format = _decode_input_audio_payload(part)
+        tmp = tempfile.NamedTemporaryFile(suffix=f".{audio_format}", delete=False)
+        try:
+            tmp.write(raw)
+            tmp.close()
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(None, lambda: transcribe_audio(tmp.name))
+        finally:
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
+
+        if result.get("success"):
+            transcript = str(result.get("transcript") or "").strip()
+            if transcript:
+                return f'[The user sent a voice message. Transcript: "{transcript}"]'
+            return "[The user sent a voice message, but it transcribed to empty text.]"
+
+        error = str(result.get("error") or "unknown error")
+        return f"[The user sent a voice message but transcription failed: {error}]"
+
+    async def _process_local_content_parts(self, content: Any) -> Any:
+        """Convert API-server-only file parts before AIAgent sees them."""
+        if not isinstance(content, list):
+            return content
+
+        output_parts: List[Dict[str, Any]] = []
+
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            ptype = str(part.get("type") or "").strip().lower()
+            if ptype in _TEXT_PART_TYPES or ptype in _IMAGE_PART_TYPES:
+                output_parts.append(part)
+                continue
+            if ptype == "file":
+                output_parts.extend(self._process_file_part(part))
+
+        if not output_parts:
+            return ""
+        if all(p.get("type") == "text" for p in output_parts):
+            return "\n\n".join(str(p.get("text", "")) for p in output_parts if p.get("text"))
+        return output_parts
+
+    def _process_file_part(self, part: Dict[str, Any]) -> List[Dict[str, str]]:
+        file_meta = part.get("file") or {}
+        filename = file_meta.get("filename") or "document"
+        file_data = file_meta.get("file_data") or ""
+        display_name = _safe_display_filename(filename)
+
+        b64data = file_data.split(",", 1)[1] if "," in file_data else file_data
+        try:
+            raw = base64.b64decode(b64data)
+        except Exception as exc:
+            logger.warning("File decode failed for %s: %s", display_name, exc)
+            return [{"type": "text", "text": f"[The user sent a file '{display_name}' but it could not be decoded.]"}]
+
+        ext = _extract_safe_ext(filename)
+        if ext not in _OYE_SUPPORTED_DOCUMENT_TYPES:
+            return [{
+                "type": "text",
+                "text": (
+                    f"[The user sent a file '{display_name}' (type {ext or 'unknown'}); "
+                    "document type is not supported by the gateway.]"
+                ),
+            }]
+
+        try:
+            cached_path = _cache_oye_document(raw, filename)
+            _cleanup_oye_documents()
+        except Exception as exc:
+            logger.warning("Failed to cache Oye document %s: %s", display_name, exc)
+            return [{"type": "text", "text": f"[The user sent a file '{display_name}' but it could not be cached.]"}]
+
+        try:
+            sandbox_path = _to_sandbox_oye_path(cached_path)
+        except ValueError as exc:
+            logger.warning("Oye document path translation failed: %s", exc)
+            sandbox_path = cached_path
+
+        mime = _OYE_SUPPORTED_DOCUMENT_TYPES[ext]
+        size_kb = max(1, len(raw) // 1024)
+        notes = [{
+            "type": "text",
+            "text": (
+                f"[The user attached {display_name} ({mime}, {size_kb} KB) at {sandbox_path} - "
+                "read it with the terminal tool when you need to.]"
+            ),
+        }]
+
+        if ext in OYE_INLINE_EXTENSIONS and len(raw) <= OYE_INLINE_MAX_BYTES:
+            try:
+                notes.append({"type": "text", "text": f"[Content of {display_name}]:\n{raw.decode('utf-8')}"})
+            except UnicodeDecodeError:
+                pass
+
+        return notes
 
     # ------------------------------------------------------------------
     # HTTP Handlers
@@ -831,7 +1171,17 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
         system_prompt = None
-        conversation_messages: List[Dict[str, str]] = []
+        conversation_messages: List[Dict[str, Any]] = []
+        conversation_message_params: List[str] = []
+        last_conversation_idx = next(
+            (
+                idx
+                for idx in range(len(messages) - 1, -1, -1)
+                if isinstance(messages[idx], dict)
+                and messages[idx].get("role") in ("user", "assistant")
+            ),
+            None,
+        )
 
         for idx, msg in enumerate(messages):
             role = msg.get("role", "")
@@ -846,10 +1196,26 @@ class APIServerAdapter(BasePlatformAdapter):
                     system_prompt = system_prompt + "\n" + content
             elif role in ("user", "assistant"):
                 try:
-                    content = _normalize_multimodal_content(raw_content)
+                    content = _normalize_multimodal_content(
+                        raw_content,
+                        allow_audio=(role == "user" and idx == last_conversation_idx),
+                        allow_local_inputs=(role == "user" and idx == last_conversation_idx),
+                    )
                 except ValueError as exc:
                     return _multimodal_validation_error(exc, param=f"messages[{idx}].content")
                 conversation_messages.append({"role": role, "content": content})
+                conversation_message_params.append(f"messages[{idx}].content")
+
+        # Upstream handles text/image content directly. Convert audio through
+        # the generic API-server path, then Oye's local file extension.
+        if conversation_messages and conversation_messages[-1].get("role") == "user":
+            last = conversation_messages[-1]
+            try:
+                content = await self._process_input_audio_parts(last.get("content", ""))
+            except ValueError as exc:
+                param = conversation_message_params[-1] if conversation_message_params else "messages.content"
+                return _multimodal_validation_error(exc, param=param)
+            last["content"] = await self._process_local_content_parts(content)
 
         # Extract the last user message as the primary input
         user_message: Any = ""
@@ -896,9 +1262,21 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 db = self._ensure_session_db()
                 if db is not None:
-                    history = db.get_messages_as_conversation(session_id)
+                    effective_session_id = provided_session_id
+                    get_compression_tip = getattr(db, "get_compression_tip", None)
+                    if callable(get_compression_tip):
+                        candidate = get_compression_tip(provided_session_id)
+                        if isinstance(candidate, str) and candidate.strip():
+                            effective_session_id = candidate
+                    if effective_session_id != provided_session_id:
+                        logger.info(
+                            "session lineage resolved: %s -> %s",
+                            provided_session_id, effective_session_id,
+                        )
+                    history = db.get_messages_as_conversation(effective_session_id)
+                    session_id = effective_session_id
             except Exception as e:
-                logger.warning("Failed to load session history for %s: %s", session_id, e)
+                logger.warning("Failed to load session history for %s: %s", provided_session_id, e)
                 history = []
         else:
             # Derive a stable session ID from the conversation fingerprint so
@@ -911,6 +1289,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     first_user = cm.get("content", "")
                     break
             session_id = _derive_chat_session_id(system_prompt, first_user)
+            provided_session_id = session_id
             # history already set from request body above
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
@@ -963,6 +1342,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     "label": label,
                 }))
 
+            def _on_reasoning(text):
+                if text:
+                    _stream_q.put(("__reasoning__", text))
+
             # Start agent in background.  agent_ref is a mutable container
             # so the SSE writer can interrupt the agent on client disconnect.
             agent_ref = [None]
@@ -973,12 +1356,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 session_id=session_id,
                 stream_delta_callback=_on_delta,
                 tool_progress_callback=_on_tool_progress,
+                reasoning_callback=_on_reasoning,
                 agent_ref=agent_ref,
             ))
 
             return await self._write_sse_chat_completion(
                 request, completion_id, model_name, created, _stream_q,
-                agent_task, agent_ref, session_id=session_id,
+                agent_task, agent_ref, session_id=provided_session_id,
             )
 
         # Non-streaming: run the agent (with optional Idempotency-Key)
@@ -1037,7 +1421,7 @@ class APIServerAdapter(BasePlatformAdapter):
             },
         }
 
-        return web.json_response(response_data, headers={"X-Hermes-Session-Id": session_id})
+        return web.json_response(response_data, headers={"X-Hermes-Session-Id": provided_session_id})
 
     async def _write_sse_chat_completion(
         self, request: "web.Request", completion_id: str, model: str,
@@ -1084,6 +1468,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 """Write a single queue item to the SSE stream.
 
                 Plain strings are sent as normal ``delta.content`` chunks.
+                Tagged tuples ``("__reasoning__", text)`` are sent as normal
+                OpenAI-compatible chunks with ``delta.reasoning_content`` so
+                clients can display model reasoning separately from the final
+                assistant text.
                 Tagged tuples ``("__tool_progress__", payload)`` are sent
                 as a custom ``event: hermes.tool.progress`` SSE event so
                 frontends can display them without storing the markers in
@@ -1094,6 +1482,13 @@ class APIServerAdapter(BasePlatformAdapter):
                     await response.write(
                         f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode()
                     )
+                elif isinstance(item, tuple) and len(item) == 2 and item[0] == "__reasoning__":
+                    reasoning_chunk = {
+                        "id": completion_id, "object": "chat.completion.chunk",
+                        "created": created, "model": model,
+                        "choices": [{"index": 0, "delta": {"reasoning_content": item[1]}, "finish_reason": None}],
+                    }
+                    await response.write(f"data: {json.dumps(reasoning_chunk)}\n\n".encode())
                 else:
                     content_chunk = {
                         "id": completion_id, "object": "chat.completion.chunk",
@@ -2251,6 +2646,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        reasoning_callback=None,
         agent_ref: Optional[list] = None,
     ) -> tuple:
         """
@@ -2274,6 +2670,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_progress_callback=tool_progress_callback,
                 tool_start_callback=tool_start_callback,
                 tool_complete_callback=tool_complete_callback,
+                reasoning_callback=reasoning_callback,
             )
             if agent_ref is not None:
                 agent_ref[0] = agent
