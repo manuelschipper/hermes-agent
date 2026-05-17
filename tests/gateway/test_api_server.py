@@ -1107,6 +1107,91 @@ class TestChatCompletionsEndpoint:
             assert '"status": "completed"' not in body
 
     @pytest.mark.asyncio
+    async def test_stream_tool_progress_ignores_tool_completion_errors(self, adapter):
+        """Tool completion failures do not emit progress events."""
+        import asyncio
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("stream_delta_callback")
+                tp_cb = kwargs.get("tool_progress_callback")
+                if tp_cb:
+                    tp_cb("tool.completed", "terminal", None, None, duration=1.25, is_error=True)
+                if cb:
+                    await asyncio.sleep(0.05)
+                    cb("The command failed.")
+                return (
+                    {"final_response": "The command failed.", "messages": [], "api_calls": 1},
+                    {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "run command"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+                assert "event: hermes.tool.progress" not in body
+                assert "event: tool_progress" not in body
+                assert '"label": "\\u2717 failed' not in body
+                assert "The command failed." in body
+
+    @pytest.mark.asyncio
+    async def test_stream_reasoning_content_delta(self, adapter):
+        """Reasoning callbacks are forwarded outside delta.content."""
+        import asyncio
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("stream_delta_callback")
+                reasoning_cb = kwargs.get("reasoning_callback")
+                if reasoning_cb:
+                    reasoning_cb("checking assumptions")
+                if cb:
+                    await asyncio.sleep(0.05)
+                    cb("Done.")
+                return (
+                    {"final_response": "Done.", "messages": [], "api_calls": 1},
+                    {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "think"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+                assert '"reasoning_content": "checking assumptions"' in body
+                assert "Done." in body
+
+                saw_reasoning = False
+                for line in body.splitlines():
+                    if not line.startswith("data: ") or line.strip() == "data: [DONE]":
+                        continue
+                    chunk = json.loads(line[len("data: "):])
+                    if chunk.get("object") != "chat.completion.chunk":
+                        continue
+                    for choice in chunk.get("choices", []):
+                        delta = choice.get("delta", {})
+                        assert "checking assumptions" not in delta.get("content", "")
+                        if delta.get("reasoning_content") == "checking assumptions":
+                            saw_reasoning = True
+
+                assert saw_reasoning
+
+    @pytest.mark.asyncio
     async def test_no_user_message_returns_400(self, adapter):
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
@@ -3105,6 +3190,38 @@ class TestSessionIdHeader:
             assert resp.status == 200
             call_kwargs = mock_run.call_args.kwargs
             # History must come from DB, not from the request body
+            assert call_kwargs["conversation_history"] == db_history
+            assert call_kwargs["user_message"] == "new question"
+
+    @pytest.mark.asyncio
+    async def test_provided_session_id_uses_compression_tip_for_history_and_writes(self, auth_adapter):
+        """Stable client ids resolve to the active compressed session tip."""
+        mock_result = {"final_response": "OK", "messages": [], "api_calls": 1}
+        db_history = [
+            {"role": "user", "content": "compressed summary"},
+            {"role": "assistant", "content": "compressed reply"},
+        ]
+        mock_db = MagicMock()
+        mock_db.get_compression_tip.return_value = "tip-session"
+        mock_db.get_messages_as_conversation.return_value = db_history
+        auth_adapter._session_db = mock_db
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    headers={"X-Hermes-Session-Id": "root-session", "Authorization": "Bearer sk-secret"},
+                    json={"model": "hermes-agent", "messages": [{"role": "user", "content": "new question"}]},
+                )
+
+            assert resp.status == 200
+            assert resp.headers.get("X-Hermes-Session-Id") == "root-session"
+            mock_db.get_compression_tip.assert_called_once_with("root-session")
+            mock_db.get_messages_as_conversation.assert_called_once_with("tip-session")
+            call_kwargs = mock_run.call_args.kwargs
+            assert call_kwargs["session_id"] == "tip-session"
             assert call_kwargs["conversation_history"] == db_history
             assert call_kwargs["user_message"] == "new question"
 
