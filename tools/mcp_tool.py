@@ -1562,12 +1562,12 @@ class MCPServerTask:
                     "manual refresh)",
                     self.name,
                 )
-                # Reset the session reference; _run_http/_run_stdio will
-                # repopulate it on successful re-entry.
+                # Reset the session reference and readiness; _run_http/_run_stdio
+                # will repopulate both on successful re-entry.  Leaving
+                # _ready set here lets handler-side recovery mistake the stale
+                # pre-reconnect session for a fresh one and retry too early.
+                self._ready.clear()
                 self.session = None
-                # Keep _ready set across reconnects so tool handlers can
-                # still detect a transient in-flight state — it'll be
-                # re-set after the fresh session initializes.
                 continue
             except asyncio.CancelledError:
                 # Task was cancelled (shutdown, gateway restart, explicit
@@ -1752,6 +1752,85 @@ def _reset_server_error(server_name: str) -> None:
     _server_error_counts[server_name] = 0
     _server_breaker_opened_at.pop(server_name, None)
 
+
+def _wait_for_server_session_ready(
+    srv: "MCPServerTask",
+    *,
+    old_session: Any = None,
+    timeout: float = 15.0,
+) -> bool:
+    """Wait for an MCP server to expose a usable session.
+
+    Tool handlers run in normal worker threads while the MCP transport lives on
+    the module's background asyncio loop. During a reconnect there is a short
+    window where ``srv.session`` is ``None`` (or still points at the stale
+    session until the lifecycle coroutine has left the transport context). A
+    handler that blindly retries in that window can burn circuit-breaker strikes
+    and return ``not connected`` even though the reconnect is already in
+    progress.
+
+    When ``old_session`` is supplied, require the observed session object to be
+    different so callers do not mistake the pre-reconnect, stale session for a
+    fresh one.
+    """
+    deadline = time.monotonic() + max(float(timeout), 0.0)
+    while time.monotonic() < deadline:
+        session = getattr(srv, "session", None)
+        ready = getattr(srv, "_ready", None)
+        is_ready = True
+        if ready is not None and hasattr(ready, "is_set"):
+            try:
+                is_ready = bool(ready.is_set())
+            except Exception:
+                is_ready = True
+        if session is not None and session is not old_session and is_ready:
+            return True
+        time.sleep(0.25)
+    return False
+
+
+def _signal_reconnect_and_wait(
+    server_name: str,
+    srv: "MCPServerTask",
+    *,
+    op_description: str,
+    timeout: float = 15.0,
+) -> bool:
+    """Ask a live MCP server task to rebuild its transport session.
+
+    The important detail is clearing ``_ready`` on the MCP event loop before
+    setting ``_reconnect_event``. Older code left ``_ready`` set across
+    reconnects, so the caller's readiness poll could return immediately and
+    retry against the same dead HTTP/stream session. That was observed as
+    repeated ``Session terminated`` / ``not connected`` / circuit-breaker
+    failures in long-lived gateway sessions even though a fresh CLI process
+    could connect successfully.
+    """
+    loop = _mcp_loop
+    if loop is None or not loop.is_running():
+        return False
+
+    old_session = getattr(srv, "session", None)
+
+    def _request_reconnect() -> None:
+        ready = getattr(srv, "_ready", None)
+        if ready is not None and hasattr(ready, "clear"):
+            ready.clear()
+        reconnect_event = getattr(srv, "_reconnect_event", None)
+        if reconnect_event is not None and hasattr(reconnect_event, "set"):
+            reconnect_event.set()
+
+    logger.info(
+        "MCP server '%s': %s requesting transport reconnect",
+        server_name, op_description,
+    )
+    loop.call_soon_threadsafe(_request_reconnect)
+    return _wait_for_server_session_ready(
+        srv,
+        old_session=old_session,
+        timeout=timeout,
+    )
+
 # ---------------------------------------------------------------------------
 # Auth-failure detection helpers (Task 6 of MCP OAuth consolidation)
 # ---------------------------------------------------------------------------
@@ -1877,28 +1956,24 @@ def _handle_auth_error_and_retry(
     if recovered:
         with _lock:
             srv = _servers.get(server_name)
+        reconnected = False
         if srv is not None and hasattr(srv, "_reconnect_event"):
-            loop = _mcp_loop
-            if loop is not None and loop.is_running():
-                loop.call_soon_threadsafe(srv._reconnect_event.set)
-                # Wait briefly for the session to come back ready. Bounded
-                # so that a stuck reconnect falls through to the error
-                # path rather than hanging the caller.
-                deadline = time.monotonic() + 15
-                while time.monotonic() < deadline:
-                    if srv.session is not None and srv._ready.is_set():
-                        break
-                    time.sleep(0.25)
+            reconnected = _signal_reconnect_and_wait(
+                server_name,
+                srv,
+                op_description=f"{op_description} after OAuth recovery",
+                timeout=15,
+            )
 
-        # A successful OAuth recovery is independent evidence that the
-        # server is viable again, so close the circuit breaker here —
-        # not only on retry success. Without this, a reconnect
-        # followed by a failing retry would leave the breaker pinned
-        # above threshold forever (the retry-exception branch below
-        # bumps the count again).  The post-reset retry still goes
-        # through _bump_server_error on failure, so a genuinely broken
-        # server will re-trip the breaker as normal.
-        _reset_server_error(server_name)
+        # A successful OAuth recovery + transport reconnect is independent
+        # evidence that the server is viable again, so close the circuit
+        # breaker here — not only on retry success. Without this, a reconnect
+        # followed by a failing retry would leave the breaker pinned above
+        # threshold forever. The post-reset retry still goes through
+        # _bump_server_error on failure, so a genuinely broken server will
+        # re-trip the breaker as normal.
+        if reconnected:
+            _reset_server_error(server_name)
 
         try:
             result = retry_call()
@@ -2027,15 +2102,12 @@ def _handle_session_expired_and_retry(
 
     # Trigger the same reconnect mechanism the OAuth recovery path
     # uses, then wait briefly for the new session to come back ready.
-    loop.call_soon_threadsafe(srv._reconnect_event.set)
-    deadline = time.monotonic() + 15
-    ready = False
-    while time.monotonic() < deadline:
-        if srv.session is not None and srv._ready.is_set():
-            ready = True
-            break
-        time.sleep(0.25)
-    if not ready:
+    if not _signal_reconnect_and_wait(
+        server_name,
+        srv,
+        op_description=op_description,
+        timeout=15,
+    ):
         logger.warning(
             "MCP server '%s': reconnect did not ready within 15s after "
             "session-expired error; falling through to error response.",
@@ -2276,6 +2348,74 @@ async def _connect_server(name: str, config: dict) -> MCPServerTask:
 # Handler / check-fn factories
 # ---------------------------------------------------------------------------
 
+def _get_connected_server_for_call(server_name: str, wait_timeout: float = 5.0):
+    """Return a connected MCP server, lazily reconnecting if necessary.
+
+    Gateway sessions can retain MCP tool schemas while the in-process server
+    task is missing or has lost its transport session (for example after an
+    OAuth token is copied in, a config reload races with startup, or a remote
+    HTTP session is garbage-collected while idle).  A direct tool call should
+    make one best-effort reconnect before surfacing ``server is not connected``
+    to the model; otherwise the only recovery path is a manual gateway restart.
+    """
+    with _lock:
+        server = _servers.get(server_name)
+
+    if server and getattr(server, "session", None):
+        return server
+
+    if server is not None and _wait_for_server_session_ready(
+        server,
+        timeout=wait_timeout,
+    ):
+        # A reconnect completed while this handler was starting.
+        # Re-read the server from the registry in case the lifecycle swapped
+        # state while the caller was waiting.
+        with _lock:
+            return _servers.get(server_name) or server
+
+    # If a stale entry exists, remove it so discover_mcp_tools/register_mcp_servers
+    # treats the configured server as reconnectable rather than idempotently
+    # skipping it because the name is already present in _servers.
+    if server is not None:
+        logger.info(
+            "MCP server '%s' has no active session; attempting lazy reconnect",
+            server_name,
+        )
+        try:
+            with _lock:
+                if _servers.get(server_name) is server:
+                    _servers.pop(server_name, None)
+            with _lock:
+                loop = _mcp_loop
+            if loop is not None and loop.is_running() and hasattr(server, "shutdown"):
+                future = asyncio.run_coroutine_threadsafe(server.shutdown(), loop)
+                future.result(timeout=15)
+        except Exception as exc:
+            logger.debug(
+                "Best-effort shutdown before lazy MCP reconnect for '%s' failed: %s",
+                server_name,
+                exc,
+            )
+    else:
+        logger.info(
+            "MCP server '%s' is not registered in-process; attempting lazy reconnect",
+            server_name,
+        )
+
+    try:
+        discover_mcp_tools()
+    except Exception as exc:
+        logger.warning("Lazy MCP reconnect for '%s' failed: %s", server_name, exc)
+
+    with _lock:
+        server = _servers.get(server_name)
+    if server and getattr(server, "session", None):
+        _reset_server_error(server_name)
+        return server
+    return None
+
+
 def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """Return a sync handler that calls an MCP tool via the background loop.
 
@@ -2310,9 +2450,11 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 }, ensure_ascii=False)
             # Cooldown elapsed → fall through as a half-open probe.
 
-        with _lock:
-            server = _servers.get(server_name)
-        if not server or not server.session:
+        server = _get_connected_server_for_call(
+            server_name,
+            wait_timeout=min(5.0, float(tool_timeout or 5.0)),
+        )
+        if not server:
             _bump_server_error(server_name)
             return json.dumps({
                 "error": f"MCP server '{server_name}' is not connected"

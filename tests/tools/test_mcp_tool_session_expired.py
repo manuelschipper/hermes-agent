@@ -113,22 +113,46 @@ def _install_stub_server(name: str = "wpcom"):
 
     server = MagicMock()
     server.name = name
+
+    ready_flag = threading.Event()
+    ready_flag.set()
+
+    class _ReadyAdapter:
+        def is_set(self):
+            return ready_flag.is_set()
+
+        def clear(self):
+            ready_flag.clear()
+
+        def set(self):
+            ready_flag.set()
+
+    server._ready = _ReadyAdapter()
+
     # _reconnect_event is called via loop.call_soon_threadsafe(…set); use
-    # a threading-safe substitute.
+    # a threading-safe substitute.  The production reconnect path must not
+    # treat the old stale session as fresh, so this test double swaps in a
+    # distinct session object when reconnect is requested.
     reconnect_flag = threading.Event()
 
     class _EventAdapter:
         def set(self):
             reconnect_flag.set()
+            old_session = server.session
+            new_session = MagicMock()
+            for method_name in (
+                "call_tool",
+                "list_resources",
+                "read_resource",
+                "list_prompts",
+                "get_prompt",
+            ):
+                if hasattr(old_session, method_name):
+                    setattr(new_session, method_name, getattr(old_session, method_name))
+            server.session = new_session
+            ready_flag.set()
 
     server._reconnect_event = _EventAdapter()
-
-    # Immediately "ready" — simulates a fast reconnect (_ready.is_set()
-    # is polled by _handle_session_expired_and_retry until the timeout).
-    ready_flag = threading.Event()
-    ready_flag.set()
-    server._ready = MagicMock()
-    server._ready.is_set = ready_flag.is_set
 
     # session attr must be truthy for the handler's initial check
     # (``if not server or not server.session``) and for the post-
@@ -189,6 +213,74 @@ def test_call_tool_handler_reconnects_on_session_expired(monkeypatch, tmp_path):
         mcp_tool._server_error_counts.pop("wpcom", None)
 
 
+def test_session_expired_retry_waits_for_new_session(monkeypatch, tmp_path):
+    """Regression for long-lived HTTP/stream MCP sessions.
+
+    If the reconnect helper only checks ``_ready.is_set()`` and
+    ``session is not None``, it can return immediately while ``session`` still
+    points at the stale transport. The retry then hits the same dead session
+    and the circuit breaker eventually reports the server as unreachable. The
+    handler must wait for a distinct session object before retrying.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from tools import mcp_tool
+    from tools.mcp_tool import _make_tool_handler
+
+    mcp_tool._ensure_mcp_loop()
+    server = MagicMock()
+    server.name = "hindsight"
+    ready_flag = threading.Event()
+    ready_flag.set()
+
+    class _ReadyAdapter:
+        def is_set(self):
+            return ready_flag.is_set()
+
+        def clear(self):
+            ready_flag.clear()
+
+        def set(self):
+            ready_flag.set()
+
+    old_session = MagicMock()
+
+    async def _old_call(*a, **kw):
+        raise RuntimeError("Session terminated")
+
+    old_session.call_tool = _old_call
+    new_session = MagicMock()
+
+    async def _new_call(*a, **kw):
+        result = MagicMock()
+        result.isError = False
+        result.content = [MagicMock(type="text", text="bank ok")]
+        result.structuredContent = None
+        return result
+
+    new_session.call_tool = _new_call
+    server.session = old_session
+    server._ready = _ReadyAdapter()
+
+    class _ReconnectAdapter:
+        def set(self):
+            server.session = new_session
+            ready_flag.set()
+
+    server._reconnect_event = _ReconnectAdapter()
+    mcp_tool._servers["hindsight"] = server
+    mcp_tool._server_error_counts.pop("hindsight", None)
+
+    try:
+        handler = _make_tool_handler("hindsight", "get_bank", 10.0)
+        parsed = json.loads(handler({}))
+        assert parsed.get("result") == "bank ok", parsed
+        assert mcp_tool._server_error_counts.get("hindsight", 0) == 0
+    finally:
+        mcp_tool._servers.pop("hindsight", None)
+        mcp_tool._server_error_counts.pop("hindsight", None)
+
+
 def test_call_tool_handler_non_session_expired_error_falls_through(
     monkeypatch, tmp_path
 ):
@@ -224,6 +316,97 @@ def test_call_tool_handler_non_session_expired_error_falls_through(
     finally:
         mcp_tool._servers.pop("srv", None)
         mcp_tool._server_error_counts.pop("srv", None)
+
+
+def test_call_tool_handler_lazy_reconnects_missing_server(monkeypatch, tmp_path):
+    """If a tool schema survives but the in-process MCP server task is
+    missing, the first tool call should run discovery once and then call the
+    freshly connected server instead of forcing a manual gateway restart."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from tools import mcp_tool
+    from tools.mcp_tool import _make_tool_handler
+
+    server, _ = _install_stub_server("lazy")
+
+    async def _call_tool(*a, **kw):
+        result = MagicMock()
+        result.isError = False
+        result.content = [MagicMock(type="text", text="lazy reconnect ok")]
+        result.structuredContent = None
+        return result
+
+    server.session.call_tool = _call_tool
+    mcp_tool._servers.pop("lazy", None)
+    mcp_tool._server_error_counts.pop("lazy", None)
+    calls = {"n": 0}
+
+    def _fake_discover():
+        calls["n"] += 1
+        mcp_tool._servers["lazy"] = server
+        return ["mcp_lazy_mytool"]
+
+    monkeypatch.setattr(mcp_tool, "discover_mcp_tools", _fake_discover)
+
+    try:
+        handler = _make_tool_handler("lazy", "mytool", 10.0)
+        out = handler({"arg": "v"})
+        parsed = json.loads(out)
+        assert parsed == {"result": "lazy reconnect ok"}
+        assert calls["n"] == 1
+        assert mcp_tool._server_error_counts.get("lazy", 0) == 0
+    finally:
+        mcp_tool._servers.pop("lazy", None)
+        mcp_tool._server_error_counts.pop("lazy", None)
+
+
+def test_call_tool_handler_lazy_reconnects_stale_server_session(
+    monkeypatch, tmp_path
+):
+    """If the server task gave up and left a stale registry entry with no
+    active session, the next tool call should reconnect from config."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from tools import mcp_tool
+    from tools.mcp_tool import _make_tool_handler
+
+    mcp_tool._ensure_mcp_loop()
+    stale_server = MagicMock()
+    stale_server.session = None
+    stale_server.shutdown = AsyncMock()
+    mcp_tool._servers["lazy"] = stale_server
+    mcp_tool._server_error_counts.pop("lazy", None)
+
+    server, _ = _install_stub_server("lazy")
+
+    async def _call_tool(*a, **kw):
+        result = MagicMock()
+        result.isError = False
+        result.content = [MagicMock(type="text", text="stale reconnect ok")]
+        result.structuredContent = None
+        return result
+
+    server.session.call_tool = _call_tool
+    calls = {"n": 0}
+
+    def _fake_discover():
+        calls["n"] += 1
+        mcp_tool._servers["lazy"] = server
+        return ["mcp_lazy_mytool"]
+
+    monkeypatch.setattr(mcp_tool, "discover_mcp_tools", _fake_discover)
+
+    try:
+        handler = _make_tool_handler("lazy", "mytool", 0.01)
+        out = handler({"arg": "v"})
+        parsed = json.loads(out)
+        assert parsed == {"result": "stale reconnect ok"}
+        assert calls["n"] == 1
+        stale_server.shutdown.assert_awaited_once()
+        assert mcp_tool._server_error_counts.get("lazy", 0) == 0
+    finally:
+        mcp_tool._servers.pop("lazy", None)
+        mcp_tool._server_error_counts.pop("lazy", None)
 
 
 def test_session_expired_handler_returns_none_without_loop(monkeypatch):
