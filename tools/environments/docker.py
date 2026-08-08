@@ -43,6 +43,7 @@ _DOCKER_SEARCH_PATHS = [
 _docker_executable: Optional[str] = None  # resolved once, cached
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _EGRESS_LABEL_KEY = "hermes-egress"
+_INSTANCE_LABEL_KEY = "hermes-instance"
 
 
 def _normalize_forward_env_names(forward_env: list[str] | None) -> list[str]:
@@ -143,6 +144,23 @@ def _get_active_profile_name() -> str:
         return get_active_profile_name() or "default"
     except Exception:
         return "default"
+
+
+def _get_instance_label() -> str:
+    """Return a stable label that isolates sandbox reuse across Hermes homes.
+
+    VPS-local: CreatBot and Sunshine share one rootless podman store and both
+    resolve to ``hermes-profile=default``, so the (task, profile) reuse key
+    alone lets one bot attach to the other's sandbox container. Hashing the
+    resolved HERMES_HOME gives each bot its own reuse namespace.
+    """
+    try:
+        from hermes_constants import get_process_hermes_home
+
+        home = str(get_process_hermes_home().resolve())
+    except Exception:
+        home = os.environ.get("HERMES_HOME", "")
+    return hashlib.sha256(home.encode("utf-8")).hexdigest()[:16]
 
 
 def reap_orphan_containers(
@@ -1072,6 +1090,21 @@ class DockerEnvironment(BaseEnvironment):
                         src,
                     )
                     continue
+                if self._home_dir:
+                    try:
+                        relative_target = Path(cache_mount["container_path"]).relative_to("/root")
+                    except ValueError:
+                        pass
+                    else:
+                        # The persistent /root bind hides the image's own
+                        # mountpoints, and gVisor refuses to create a nested
+                        # bind whose target does not already exist. Upstream
+                        # adds new cache dirs over time (videos, web, images),
+                        # so create them on demand rather than by hand.
+                        (Path(self._home_dir) / relative_target).mkdir(
+                            parents=True,
+                            exist_ok=True,
+                        )
                 volume_args.extend([
                     "-v",
                     f"{cache_mount['host_path']}:{cache_mount['container_path']}:ro",
@@ -1366,10 +1399,12 @@ class DockerEnvironment(BaseEnvironment):
         # container-start time and never changes for the container's lifetime.
         profile_name = _sanitize_label_value(_get_active_profile_name())
         task_label = _sanitize_label_value(task_id)
+        instance_label = _get_instance_label()
         label_args = [
             "--label", "hermes-agent=1",
             "--label", f"hermes-task-id={task_label}",
             "--label", f"hermes-profile={profile_name}",
+            "--label", f"{_INSTANCE_LABEL_KEY}={instance_label}",
             "--label", f"{_EGRESS_LABEL_KEY}={egress_label}",
         ]
         # Save args for container recreation on "No such container" recovery.
@@ -1382,6 +1417,7 @@ class DockerEnvironment(BaseEnvironment):
             "hermes-agent": "1",
             "hermes-task-id": task_label,
             "hermes-profile": profile_name,
+            _INSTANCE_LABEL_KEY: instance_label,
             _EGRESS_LABEL_KEY: egress_label,
         }
 
@@ -1399,7 +1435,7 @@ class DockerEnvironment(BaseEnvironment):
         reused = False
         if persist_across_processes:
             existing = self._find_reusable_container(
-                task_label, profile_name, egress_label,
+                task_label, profile_name, instance_label, egress_label,
             )
             if existing is not None:
                 container_id, state = existing
@@ -1659,7 +1695,10 @@ class DockerEnvironment(BaseEnvironment):
         task_label = self._labels.get("hermes-task-id", "")
         profile_label = self._labels.get("hermes-profile", "")
         existing = self._find_reusable_container(
-            task_label, profile_label, self._labels.get(_EGRESS_LABEL_KEY, "off"),
+            task_label,
+            profile_label,
+            self._labels.get(_INSTANCE_LABEL_KEY, ""),
+            self._labels.get(_EGRESS_LABEL_KEY, "off"),
         )
         if existing is not None:
             cid, state = existing
@@ -1823,6 +1862,7 @@ class DockerEnvironment(BaseEnvironment):
         self,
         task_label: str,
         profile_label: str,
+        instance_label: str,
         egress_label: str,
     ) -> Optional[tuple[str, str]]:
         """Look for an existing container labeled for this (task, profile).
@@ -1842,6 +1882,7 @@ class DockerEnvironment(BaseEnvironment):
                 "--filter", "label=hermes-agent=1",
                 "--filter", f"label=hermes-task-id={task_label}",
                 "--filter", f"label=hermes-profile={profile_label}",
+                "--filter", f"label={_INSTANCE_LABEL_KEY}={instance_label}",
             ]
             if egress_label != "off":
                 filters.extend(["--filter", f"label={_EGRESS_LABEL_KEY}={egress_label}"])
